@@ -1,0 +1,20 @@
+[package]
+name = "kds"
+version = "0.1.0"
+edition = "2021"
+description = "KD Savings: compact command evidence and local log drilldown"
+license = "MIT"
+repository = "https://github.com/kds-ai/kds"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+dirs = "6"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"

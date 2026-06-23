@@ -1,0 +1,10 @@
+/target/
+/.kds/
+/logs/
+*.log
+*.tmp
+*.bak
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
