@@ -118,7 +118,7 @@ function _kds_native {{
   param([string]$Name)
   $cmd = Get-Command $Name -CommandType Application,ExternalScript -ErrorAction SilentlyContinue | Select-Object -First 1
   if ($cmd) {{ return $cmd.Source }}
-  return $Name
+  return $null
 }}
 function _kds_restore_args {{
   param([object[]]$Rest, [string]$Statement)
@@ -147,6 +147,11 @@ function _kds_restore_args {{
 function _kds_call_native {{
   param([string]$Name, [object[]]$Rest)
   $native = _kds_native $Name
+  if (-not $native) {{
+    [Console]::Error.WriteLine("kds hook: command not found: $Name")
+    $global:LASTEXITCODE = 127
+    return
+  }}
   & $native @Rest
 }}
 function _kds_wrap {{
@@ -180,10 +185,6 @@ function pytest {{
 function python {{
   $rest = @(_kds_restore_args $args $MyInvocation.Statement)
   if ($rest.Count -ge 2 -and $rest[0] -eq '-m' -and $rest[1] -eq 'pytest') {{ _kds_wrap 'python' $rest }} else {{ _kds_call_native 'python' $rest }}
-}}
-function git {{
-  $rest = @(_kds_restore_args $args $MyInvocation.Statement)
-  if ($rest.Count -gt 0 -and @('status') -contains $rest[0]) {{ _kds_wrap 'git' $rest }} else {{ _kds_call_native 'git' $rest }}
 }}
 {END}
 "#
@@ -303,6 +304,9 @@ cargo run -- --help
 cargo test -- --nocapture
 "git-status"
 git status --short
+"git-status-capture"
+$s = git status --porcelain
+"captured:$($s -join '|')"
 "git-diff"
 git diff --exit-code
 "npm-test"
@@ -361,8 +365,13 @@ just deploy
             "stdout:\n{stdout}"
         );
         assert!(
-            stdout.contains("git-status\r\nkds:[--]\r\nkds:[git]\r\nkds:[status]\r\nkds:[--short]")
-                || stdout.contains("git-status\nkds:[--]\nkds:[git]\nkds:[status]\nkds:[--short]"),
+            stdout.contains("git-status\r\n[status]\r\n[--short]")
+                || stdout.contains("git-status\n[status]\n[--short]"),
+            "stdout:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("git-status-capture\r\ncaptured:[status]|[--porcelain]")
+                || stdout.contains("git-status-capture\ncaptured:[status]|[--porcelain]"),
             "stdout:\n{stdout}"
         );
         assert!(
@@ -405,5 +414,72 @@ just deploy
                 || stdout.contains("just-deploy\nnative:[deploy]"),
             "stdout:\n{stdout}"
         );
+    }
+
+    #[test]
+    fn powershell_hook_missing_native_commands_do_not_recurse() {
+        if !cfg!(windows) {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let script_path = dir.path().join("missing-native.ps1");
+        let mut script = std::fs::File::create(&script_path).unwrap();
+        write!(
+            script,
+            r#"
+{}
+$env:PATH = ''
+"missing-cargo"
+cargo run
+"missing-just"
+just deploy
+"missing-npm"
+npm publish
+"missing-pnpm"
+pnpm deploy
+"missing-python"
+python --version
+"after-missing"
+exit $LASTEXITCODE
+"#,
+            hook_block().unwrap()
+        )
+        .unwrap();
+        drop(script);
+
+        let output = match Command::new("pwsh")
+            .arg("-NoProfile")
+            .arg("-ExecutionPolicy")
+            .arg("Bypass")
+            .arg("-File")
+            .arg(&script_path)
+            .output()
+        {
+            Ok(output) => output,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+            Err(err) => panic!("run pwsh: {err}"),
+        };
+
+        assert_eq!(output.status.code(), Some(127));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        for marker in [
+            "missing-cargo",
+            "missing-just",
+            "missing-npm",
+            "missing-pnpm",
+            "missing-python",
+        ] {
+            assert!(stdout.contains(marker), "stdout:\n{stdout}");
+        }
+        assert!(stdout.contains("after-missing"), "stdout:\n{stdout}");
+        for command in ["cargo", "just", "npm", "pnpm", "python"] {
+            assert!(
+                stderr.contains(&format!("kds hook: command not found: {command}")),
+                "stderr:\n{stderr}"
+            );
+        }
+        assert!(!stderr.contains("call depth overflow"), "stderr:\n{stderr}");
     }
 }

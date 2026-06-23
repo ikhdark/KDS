@@ -27,8 +27,9 @@ From a KDS source checkout:
 kds doctor
 ```
 
-After install and a new PowerShell session, allowlisted noisy commands such as
-`cargo test` and `git status` are routed through KDS automatically.
+After install and a new PowerShell session, allowlisted noisy build and test
+commands such as `cargo test` and `npm test` are routed through KDS
+automatically.
 
 Manual fallback/debug usage is also available:
 
