@@ -7,6 +7,8 @@ use std::sync::OnceLock;
 
 use crate::storage::SummarySidecar;
 
+const COMPACT_RUN_HEADER: &str = "KDS";
+
 #[derive(Debug, Clone)]
 pub struct ExtractedSummary {
     pub error_count: usize,
@@ -264,7 +266,7 @@ fn known_secret_re() -> &'static Regex {
 pub fn format_compact_with_paths(sidecar: &SummarySidecar, show_paths: bool) -> String {
     if sidecar.exit_code == 0 && sidecar.warning_count == 0 {
         return format!(
-            "KDS\nRun ID: {}\nExit code: 0\nElapsed: {}\n{}\nEstimated output reduction: {} lines ({:.1}%)\nSummary: success\nWarnings: 0\n",
+            "{COMPACT_RUN_HEADER}\nRun ID: {}\nExit code: 0\nElapsed: {}\n{}\nEstimated output reduction: {} lines ({:.1}%)\nSummary: success\nWarnings: 0\n",
             sidecar.run_id,
             sidecar.elapsed,
             log_line(sidecar, show_paths),
@@ -274,7 +276,8 @@ pub fn format_compact_with_paths(sidecar: &SummarySidecar, show_paths: bool) -> 
     }
 
     let mut out = String::new();
-    out.push_str("KDS\n");
+    out.push_str(COMPACT_RUN_HEADER);
+    out.push('\n');
     out.push_str(&format!("Run ID: {}\n", sidecar.run_id));
     out.push_str(&format!(
         "Command: {}\n",
