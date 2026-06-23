@@ -34,6 +34,10 @@ pub fn run(argv: Vec<String>, mode: Mode, show_paths: bool) -> Result<i32> {
         return Ok(2);
     }
 
+    if should_passthrough(&argv) {
+        return passthrough(&argv);
+    }
+
     let cwd = std::env::current_dir()?;
     let started = Local::now();
     let command = storage::command_string(&argv);
@@ -249,6 +253,84 @@ pub fn run(argv: Vec<String>, mode: Mode, show_paths: bool) -> Result<i32> {
     }
 
     Ok(exit_code)
+}
+
+fn should_passthrough(argv: &[String]) -> bool {
+    git_subcommand(argv).is_some_and(|command| command == "diff")
+}
+
+fn git_subcommand(argv: &[String]) -> Option<&str> {
+    let command = argv.first()?;
+    let stem = std::path::Path::new(command).file_stem()?.to_str()?;
+    if !stem.eq_ignore_ascii_case("git") {
+        return None;
+    }
+
+    let mut args = argv.iter().skip(1).map(String::as_str).peekable();
+    while let Some(arg) = args.next() {
+        if arg == "--" {
+            return None;
+        }
+        if arg == "-C"
+            || arg == "-c"
+            || arg == "--config-env"
+            || arg == "--exec-path"
+            || arg == "--git-dir"
+            || arg == "--work-tree"
+            || arg == "--namespace"
+            || arg == "--super-prefix"
+        {
+            let _ = args.next();
+            continue;
+        }
+        if arg == "-p"
+            || arg == "--paginate"
+            || arg == "-P"
+            || arg == "--no-pager"
+            || arg == "--bare"
+            || arg == "--no-replace-objects"
+            || arg == "--literal-pathspecs"
+            || arg == "--glob-pathspecs"
+            || arg == "--noglob-pathspecs"
+            || arg == "--icase-pathspecs"
+        {
+            continue;
+        }
+        if arg.starts_with("-C")
+            || arg.starts_with("-c")
+            || arg.starts_with("--config-env=")
+            || arg.starts_with("--exec-path=")
+            || arg.starts_with("--git-dir=")
+            || arg.starts_with("--work-tree=")
+            || arg.starts_with("--namespace=")
+            || arg.starts_with("--super-prefix=")
+        {
+            continue;
+        }
+        if arg.starts_with('-') {
+            continue;
+        }
+        return Some(arg);
+    }
+
+    None
+}
+
+fn passthrough(argv: &[String]) -> Result<i32> {
+    let program = storage::resolve_command(&argv[0]);
+    let status = Command::new(&program).args(&argv[1..]).status();
+    let status = match status {
+        Ok(status) => status,
+        Err(err) => {
+            eprintln!(
+                "kds: failed to passthrough `{}`: {err}",
+                storage::command_string(argv)
+            );
+            return Ok(1);
+        }
+    };
+
+    Ok(status.code().unwrap_or(1))
 }
 
 fn update_metrics(paths: &Paths, sidecar: &SummarySidecar) -> Result<()> {

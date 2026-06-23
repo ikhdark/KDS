@@ -219,7 +219,7 @@ function pytest {{
 }}
 function python {{
   $rest = @(_kds_restore_args $args $MyInvocation.Statement)
-  if ($rest.Count -ge 2 -and $rest[0] -eq '-m' -and $rest[1] -eq 'pytest') {{ _kds_wrap 'python' $rest }} else {{ _kds_call_native 'python' $rest }}
+  if ($rest.Count -ge 2 -and $rest[0] -eq '-m' -and (@('pytest','unittest') -contains $rest[1])) {{ _kds_wrap 'python' $rest }} else {{ _kds_call_native 'python' $rest }}
 }}
 {END}
 "#
@@ -350,6 +350,7 @@ function prompt {{ 'BASE> ' }}
         let fake_just = dir.path().join("just.cmd");
         let fake_npm = dir.path().join("npm.cmd");
         let fake_pnpm = dir.path().join("pnpm.cmd");
+        let fake_python = dir.path().join("python.cmd");
         let fake_kds = dir.path().join("kds.cmd");
         std::fs::write(
             &fake_cargo,
@@ -361,7 +362,7 @@ function prompt {{ 'BASE> ' }}
             "@echo off\r\n:loop\r\nif \"%~1\"==\"\" goto end\r\necho [%~1]\r\nshift\r\ngoto loop\r\n:end\r\n",
         )
         .unwrap();
-        for fake in [&fake_just, &fake_npm, &fake_pnpm] {
+        for fake in [&fake_just, &fake_npm, &fake_pnpm, &fake_python] {
             std::fs::write(
                 fake,
                 "@echo off\r\n:loop\r\nif \"%~1\"==\"\" goto end\r\necho native:[%~1]\r\nshift\r\ngoto loop\r\n:end\r\n",
@@ -407,6 +408,12 @@ pnpm run deploy
 just test
 "just-deploy"
 just deploy
+"python-pytest"
+python -m pytest scripts/test_example.py
+"python-unittest"
+python -m unittest scripts.test_publish_local_codex
+"python-script"
+python scripts/test_publish_local_codex.py
 "#,
             hook_block().unwrap(),
             dir.path().display(),
@@ -496,6 +503,21 @@ just deploy
         assert!(
             stdout.contains("just-deploy\r\nnative:[deploy]")
                 || stdout.contains("just-deploy\nnative:[deploy]"),
+            "stdout:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("python-pytest\r\nkds:[--]\r\nkds:[python]\r\nkds:[-m]\r\nkds:[pytest]\r\nkds:[scripts/test_example.py]")
+                || stdout.contains("python-pytest\nkds:[--]\nkds:[python]\nkds:[-m]\nkds:[pytest]\nkds:[scripts/test_example.py]"),
+            "stdout:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("python-unittest\r\nkds:[--]\r\nkds:[python]\r\nkds:[-m]\r\nkds:[unittest]\r\nkds:[scripts.test_publish_local_codex]")
+                || stdout.contains("python-unittest\nkds:[--]\nkds:[python]\nkds:[-m]\nkds:[unittest]\nkds:[scripts.test_publish_local_codex]"),
+            "stdout:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("python-script\r\nnative:[scripts/test_publish_local_codex.py]")
+                || stdout.contains("python-script\nnative:[scripts/test_publish_local_codex.py]"),
             "stdout:\n{stdout}"
         );
     }

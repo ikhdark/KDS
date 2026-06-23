@@ -83,6 +83,9 @@ lines are the deliverable, such as readiness evidence, `git status`,
 `git diff --name-only`, `git diff --check`, tracked diff hash commands, or
 publish/install proof-line extraction.
 
+If `git diff ...` is accidentally invoked through KDS, KDS passes it through to
+native Git without writing KDS run artifacts.
+
 Do not use KDS for interactive commands, password prompts, SSH sessions,
 long-running daemons, commands likely to print secrets, exact `rg` or
 `git grep` searches, or tiny commands where wrapping adds no value.

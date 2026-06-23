@@ -19,6 +19,10 @@ Git commands are not wrapped automatically because `git status` output is often
 captured by scripts, prompt themes, and other tools. Run `kds -- git status`
 explicitly when KDS capture is desired.
 
+`git diff ...` is an exact-output workflow. If it is accidentally invoked
+through KDS, KDS passes it through to native Git without writing KDS run
+artifacts.
+
 For readiness workflows, keep exact evidence commands native. Do not route
 proof-line commands through KDS when their output is the deliverable, including
 `git status`, `git diff --name-only`, `git diff --check`, tracked diff hash
@@ -28,6 +32,11 @@ For package scripts and `just`, the automatic hook wraps common verification
 tasks only: `test`, `build`, `check`, `lint`, `typecheck`, `ci`, and `clippy`.
 Other script or recipe names run natively because they may deploy, prompt, or
 print sensitive operational output.
+
+For Python, the automatic hook wraps test runners only: `pytest`,
+`python -m pytest`, and `python -m unittest`. Other `python ...` commands run
+natively because they may be interactive, long-running, or print sensitive
+operational output.
 
 Managed PowerShell profile block:
 

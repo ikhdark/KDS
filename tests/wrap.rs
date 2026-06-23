@@ -42,6 +42,33 @@ fn ignored_args_command(dir: &Path) -> PathBuf {
     }
 }
 
+fn fake_git_command(dir: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let path = dir.join("git.cmd");
+        fs::write(
+            &path,
+            "@echo off\r\n:loop\r\nif \"%~1\"==\"\" goto end\r\necho native-git:[%~1]\r\nshift\r\ngoto loop\r\n:end\r\n",
+        )
+        .unwrap();
+        path
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("git");
+        fs::write(
+            &path,
+            "#!/bin/sh\nfor arg in \"$@\"; do printf 'native-git:[%s]\\n' \"$arg\"; done\n",
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o700);
+        fs::set_permissions(&path, perms).unwrap();
+        path
+    }
+}
+
 #[test]
 fn wraps_real_command_and_writes_local_run_artifacts() {
     let kds_home = tempfile::tempdir().unwrap();
@@ -104,6 +131,35 @@ fn show_paths_explicitly_prints_log_path() {
         stdout.contains(&kds_home.path().display().to_string()),
         "stdout:\n{stdout}"
     );
+}
+
+#[test]
+fn git_diff_passes_through_without_kds_artifacts() {
+    let kds_home = tempfile::tempdir().unwrap();
+    let shim_dir = tempfile::tempdir().unwrap();
+    let _git = fake_git_command(shim_dir.path());
+    let old_path = std::env::var_os("PATH").unwrap_or_default();
+    let mut paths = vec![shim_dir.path().to_path_buf()];
+    paths.extend(std::env::split_paths(&old_path));
+    let path = std::env::join_paths(paths).unwrap();
+
+    let output = Command::new(kds_bin())
+        .env("KDS_HOME", kds_home.path())
+        .env("PATH", path)
+        .arg("--")
+        .arg("git")
+        .arg("diff")
+        .arg("--check")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("native-git:[diff]"), "stdout:\n{stdout}");
+    assert!(stdout.contains("native-git:[--check]"), "stdout:\n{stdout}");
+    assert!(!stdout.starts_with("KDS\n"), "stdout:\n{stdout}");
+    let logs = collect_files(&kds_home.path().join("logs"), "log");
+    assert!(logs.is_empty(), "logs: {logs:?}");
 }
 
 #[test]
