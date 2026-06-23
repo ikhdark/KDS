@@ -134,6 +134,14 @@ fn hook_block() -> Result<String> {
         r#"{START}
 # Managed by KDS. Remove with: kds hook uninstall powershell
 $script:KdsExe = '{exe}'
+function KDS {{
+  $kdsArgs = @($args)
+  $kdsCommands = @('run','raw','gain','doctor','logs','evidence','init','hook','help')
+  if ($kdsArgs.Count -gt 0 -and -not ([string]$kdsArgs[0]).StartsWith('-') -and -not ($kdsCommands -contains [string]$kdsArgs[0])) {{
+    $kdsArgs = @('--') + $kdsArgs
+  }}
+  & $script:KdsExe @kdsArgs
+}}
 if (-not $global:KdsPromptWrapped) {{
   $global:KdsPromptWrapped = $true
   $promptCommand = Get-Command prompt -CommandType Function -ErrorAction SilentlyContinue
@@ -191,7 +199,8 @@ function _kds_call_native {{
 }}
 function _kds_wrap {{
   param([string]$Name, [object[]]$Rest)
-  & $script:KdsExe -- $Name @Rest
+  $kdsArgs = @('--', $Name) + $Rest
+  KDS @kdsArgs
 }}
 function _kds_safe_task {{
   param([string]$Name)
@@ -273,6 +282,25 @@ mod tests {
         let removed = remove_block(&with);
         assert!(removed.contains("before"));
         assert!(!removed.contains("# kds-hook-start"));
+    }
+
+    #[test]
+    fn hook_block_wraps_with_friendly_kds_entrypoint() {
+        let block = hook_block().unwrap();
+        assert!(block.contains("function KDS {"), "block:\n{block}");
+        assert!(
+            block.contains("$kdsCommands = @('run','raw','gain','doctor','logs','evidence','init','hook','help')"),
+            "block:\n{block}"
+        );
+        assert!(
+            block.contains("$kdsArgs = @('--', $Name) + $Rest"),
+            "block:\n{block}"
+        );
+        assert!(block.contains("KDS @kdsArgs"), "block:\n{block}");
+        assert!(
+            !block.contains("& $script:KdsExe -- $Name @Rest"),
+            "block:\n{block}"
+        );
     }
 
     #[test]
@@ -383,6 +411,10 @@ function prompt {{ 'BASE> ' }}
 {}
 $env:PATH = '{};' + $env:PATH
 $script:KdsExe = '{}'
+"manual-kds-command"
+KDS gain
+"manual-kds-wrap"
+KDS -- cargo test
 "native"
 cargo run -- --help
 "wrapped"
@@ -442,6 +474,16 @@ python scripts/test_publish_local_codex.py
             String::from_utf8_lossy(&output.stderr)
         );
         let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("manual-kds-command\r\nkds:[gain]")
+                || stdout.contains("manual-kds-command\nkds:[gain]"),
+            "stdout:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("manual-kds-wrap\r\nkds:[--]\r\nkds:[cargo]\r\nkds:[test]")
+                || stdout.contains("manual-kds-wrap\nkds:[--]\nkds:[cargo]\nkds:[test]"),
+            "stdout:\n{stdout}"
+        );
         assert!(
             stdout.contains("native\r\n[run]\r\n[--]\r\n[--help]")
                 || stdout.contains("native\n[run]\n[--]\n[--help]"),
