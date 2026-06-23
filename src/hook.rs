@@ -134,6 +134,21 @@ fn hook_block() -> Result<String> {
         r#"{START}
 # Managed by KDS. Remove with: kds hook uninstall powershell
 $script:KdsExe = '{exe}'
+if (-not $global:KdsPromptWrapped) {{
+  $global:KdsPromptWrapped = $true
+  $promptCommand = Get-Command prompt -CommandType Function -ErrorAction SilentlyContinue
+  $global:KdsPromptOriginal = if ($promptCommand) {{ $promptCommand.ScriptBlock }} else {{ $null }}
+  function global:prompt {{
+    $basePrompt = if ($global:KdsPromptOriginal) {{
+      & $global:KdsPromptOriginal
+    }} else {{
+      "PS $($executionContext.SessionState.Path.CurrentLocation)$('>' * ($nestedPromptLevel + 1)) "
+    }}
+    $text = [string]$basePrompt
+    if ($text -match '^\s*KDS(\s|>|:|\]|$)') {{ return $text }}
+    return "KDS $text"
+  }}
+}}
 function _kds_native {{
   param([string]$Name)
   $cmd = Get-Command $Name -CommandType Application,ExternalScript -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -272,6 +287,55 @@ mod tests {
         let original = "# kds-hook-end\nbefore\n# kds-hook-start\n";
         assert!(!has_block(original));
         assert_eq!(remove_block(original), original);
+    }
+
+    #[test]
+    fn powershell_hook_prompt_marks_existing_prompt_without_duplication() {
+        if !cfg!(windows) {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let script_path = dir.path().join("prompt.ps1");
+        let mut script = std::fs::File::create(&script_path).unwrap();
+        write!(
+            script,
+            r#"
+function prompt {{ 'BASE> ' }}
+{}
+"prompt1=$(prompt)"
+{}
+"prompt2=$(prompt)"
+"#,
+            hook_block().unwrap(),
+            hook_block().unwrap()
+        )
+        .unwrap();
+        drop(script);
+
+        let output = match Command::new("pwsh")
+            .arg("-NoProfile")
+            .arg("-ExecutionPolicy")
+            .arg("Bypass")
+            .arg("-File")
+            .arg(&script_path)
+            .output()
+        {
+            Ok(output) => output,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+            Err(err) => panic!("run pwsh: {err}"),
+        };
+
+        assert!(
+            output.status.success(),
+            "stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("prompt1=KDS BASE>"), "stdout:\n{stdout}");
+        assert!(stdout.contains("prompt2=KDS BASE>"), "stdout:\n{stdout}");
+        assert!(!stdout.contains("KDS KDS"), "stdout:\n{stdout}");
     }
 
     #[test]

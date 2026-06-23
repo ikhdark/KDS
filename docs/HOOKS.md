@@ -7,6 +7,10 @@ profile before writing the managed block.
 The hook is allowlisted and conservative. If it is uncertain, it runs the
 original command unchanged.
 
+Interactive PowerShell prompts show a `KDS` prefix after the hook loads. The
+prompt marker is only a visibility signal; automatic capture still follows the
+allowlist rules below.
+
 The hook must not wrap KDS itself, precise searches, interactive sessions,
 password prompts, SSH sessions, long-running daemons, or commands likely to
 print secrets.
@@ -14,6 +18,11 @@ print secrets.
 Git commands are not wrapped automatically because `git status` output is often
 captured by scripts, prompt themes, and other tools. Run `kds -- git status`
 explicitly when KDS capture is desired.
+
+For readiness workflows, keep exact evidence commands native. Do not route
+proof-line commands through KDS when their output is the deliverable, including
+`git status`, `git diff --name-only`, `git diff --check`, tracked diff hash
+commands, and publish/install proof-line extraction.
 
 For package scripts and `just`, the automatic hook wraps common verification
 tasks only: `test`, `build`, `check`, `lint`, `typecheck`, `ci`, and `clippy`.

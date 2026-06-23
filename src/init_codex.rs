@@ -146,14 +146,18 @@ fn backup_existing(path: &PathBuf) -> Result<Option<PathBuf>> {
 fn kds_guidance() -> String {
     r#"# KDS Usage
 
-Use KDS for noisy non-interactive commands. Prefer explicit forms when hooks are
-unavailable:
+Use KDS for noisy non-interactive build and test commands. Prefer explicit
+forms when hooks are unavailable:
 
 - `kds -- cargo test`
 - `kds -- just ...`
 - `kds -- npm test`
 - `kds -- pnpm test`
 - `kds -- pytest`
+
+Do not use KDS when exact output lines are the deliverable. Run readiness and
+proof commands natively, including `git status`, `git diff --name-only`,
+`git diff --check`, tracked diff hash commands, and publish/install proof-line extraction.
 
 Do not use KDS for precise `rg`, `git grep`, small commands, interactive
 commands, password prompts, SSH sessions, long-running daemons, or commands
@@ -193,5 +197,24 @@ mod tests {
         let original = "<!-- /kds-instructions -->\nbefore\n<!-- kds-instructions -->\n";
         assert!(!has_block(original));
         assert_eq!(remove_block(original), original);
+    }
+
+    #[test]
+    fn generated_guidance_keeps_exact_readiness_evidence_native() {
+        let guidance = kds_guidance();
+        for expected in [
+            "noisy non-interactive build and test commands",
+            "Do not use KDS when exact output lines are the deliverable",
+            "`git status`",
+            "`git diff --name-only`",
+            "`git diff --check`",
+            "tracked diff hash commands",
+            "publish/install proof-line extraction",
+        ] {
+            assert!(
+                guidance.contains(expected),
+                "expected {expected:?} in:\n{guidance}"
+            );
+        }
     }
 }

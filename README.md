@@ -78,6 +78,11 @@ guardrail, not a guarantee that every possible secret-like value is removed.
 
 ## When Not To Use KDS
 
+Use KDS for noisy build and test commands. Do not use KDS when exact output
+lines are the deliverable, such as readiness evidence, `git status`,
+`git diff --name-only`, `git diff --check`, tracked diff hash commands, or
+publish/install proof-line extraction.
+
 Do not use KDS for interactive commands, password prompts, SSH sessions,
 long-running daemons, commands likely to print secrets, exact `rg` or
 `git grep` searches, or tiny commands where wrapping adds no value.
