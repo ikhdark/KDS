@@ -22,7 +22,7 @@ pub fn extract(stdout: &str, stderr: &str, exit_code: i32) -> ExtractedSummary {
     } else {
         format!("{stdout}\n{stderr}")
     };
-    let combined = strip_ansi(&raw_combined);
+    let combined = redact_sensitive_text(&strip_ansi(&raw_combined));
     let lines: Vec<String> = combined
         .lines()
         .map(|line| line.trim_end().to_string())
@@ -37,7 +37,10 @@ pub fn extract(stdout: &str, stderr: &str, exit_code: i32) -> ExtractedSummary {
         .iter()
         .filter(|line| {
             let lower = line.to_ascii_lowercase();
-            lower.contains("warning:") || lower.starts_with("warn ") || lower.contains(" npm warn ")
+            lower.contains("warning:")
+                || lower.starts_with("warn ")
+                || lower.starts_with("npm warn ")
+                || lower.contains(" npm warn ")
         })
         .count();
 
@@ -81,6 +84,123 @@ fn strip_ansi(text: &str) -> String {
     static ANSI_RE: OnceLock<Regex> = OnceLock::new();
     let re = ANSI_RE.get_or_init(|| Regex::new(r"\x1b\[[0-?]*[ -/]*[@-~]").unwrap());
     re.replace_all(text, "").to_string()
+}
+
+pub fn redact_sensitive_text(text: &str) -> String {
+    let mut redacted = text.to_string();
+    for (pattern, replacement) in [
+        (url_credentials_re(), "${1}[redacted]@"),
+        (flag_assignment_re(), "${1}${2}[redacted]"),
+        (flag_value_re(), "${1}${2}[redacted]"),
+        (authorization_re(), "${1}[redacted]"),
+        (keyed_secret_re(), "${1}${2}[redacted]${3}"),
+        (bearer_re(), "${1}[redacted]"),
+        (known_secret_re(), "[redacted-secret]"),
+    ] {
+        redacted = pattern.replace_all(&redacted, replacement).to_string();
+    }
+    redacted
+}
+
+pub fn redact_argv(argv: &[String]) -> Vec<String> {
+    let mut redacted = Vec::with_capacity(argv.len());
+    let mut redact_next = false;
+    for arg in argv {
+        if redact_next {
+            redacted.push("[redacted]".to_string());
+            redact_next = false;
+            continue;
+        }
+        if is_sensitive_flag(arg) {
+            redacted.push(arg.clone());
+            redact_next = true;
+            continue;
+        }
+        redacted.push(redact_sensitive_text(arg));
+    }
+    redacted
+}
+
+fn is_sensitive_flag(arg: &str) -> bool {
+    if !arg.starts_with('-') || arg.contains('=') {
+        return false;
+    }
+    let normalized = arg
+        .trim_start_matches('-')
+        .to_ascii_lowercase()
+        .replace('_', "-");
+    matches!(
+        normalized.as_str(),
+        "api-key"
+            | "token"
+            | "access-token"
+            | "auth-token"
+            | "refresh-token"
+            | "id-token"
+            | "secret"
+            | "client-secret"
+            | "password"
+            | "passwd"
+            | "pwd"
+    )
+}
+
+fn url_credentials_re() -> &'static Regex {
+    static URL_CREDENTIALS_RE: OnceLock<Regex> = OnceLock::new();
+    URL_CREDENTIALS_RE
+        .get_or_init(|| Regex::new(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/\s:@]+:[^/\s@]+@").unwrap())
+}
+
+fn flag_assignment_re() -> &'static Regex {
+    static FLAG_ASSIGNMENT_RE: OnceLock<Regex> = OnceLock::new();
+    FLAG_ASSIGNMENT_RE.get_or_init(|| {
+        Regex::new(
+            r"(?i)(^|\s)(--[A-Za-z0-9_-]*(?:api[-_]?key|token|secret|password|passwd|pwd)[A-Za-z0-9_-]*=)[^\s]+",
+        )
+        .unwrap()
+    })
+}
+
+fn flag_value_re() -> &'static Regex {
+    static FLAG_VALUE_RE: OnceLock<Regex> = OnceLock::new();
+    FLAG_VALUE_RE.get_or_init(|| {
+        Regex::new(
+            r"(?i)(^|\s)(--[A-Za-z0-9_-]*(?:api[-_]?key|token|secret|password|passwd|pwd)[A-Za-z0-9_-]*\s+)[^\s]+",
+        )
+        .unwrap()
+    })
+}
+
+fn authorization_re() -> &'static Regex {
+    static AUTHORIZATION_RE: OnceLock<Regex> = OnceLock::new();
+    AUTHORIZATION_RE.get_or_init(|| {
+        Regex::new(r#"(?i)\b(authorization\s*[:=]\s*)(?:bearer\s+)?[^\s'",;]+"#).unwrap()
+    })
+}
+
+fn keyed_secret_re() -> &'static Regex {
+    static KEYED_SECRET_RE: OnceLock<Regex> = OnceLock::new();
+    KEYED_SECRET_RE.get_or_init(|| {
+        Regex::new(
+            r#"(?i)\b([A-Z0-9_-]*(?:API[-_]?KEY|TOKEN|SECRET|PASSWORD|PASSWD|PWD)[A-Z0-9_-]*\s*[:=]\s*)(['"]?)[^\s'",;]+(['"]?)"#,
+        )
+        .unwrap()
+    })
+}
+
+fn bearer_re() -> &'static Regex {
+    static BEARER_RE: OnceLock<Regex> = OnceLock::new();
+    BEARER_RE.get_or_init(|| Regex::new(r"(?i)\b(bearer\s+)[A-Za-z0-9._~+/=-]{8,}").unwrap())
+}
+
+fn known_secret_re() -> &'static Regex {
+    static KNOWN_SECRET_RE: OnceLock<Regex> = OnceLock::new();
+    KNOWN_SECRET_RE.get_or_init(|| {
+        Regex::new(
+            r"\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16})\b",
+        )
+        .unwrap()
+    })
 }
 
 pub fn format_compact(sidecar: &SummarySidecar) -> String {
@@ -266,5 +386,52 @@ mod tests {
     fn strips_ansi_from_summary_signals() {
         let summary = extract("", "\x1b[31;1mError: noisy failure\x1b[0m\n", 1);
         assert_eq!(summary.top_errors[0], "Error: noisy failure");
+    }
+
+    #[test]
+    fn counts_npm_warnings_at_line_start() {
+        let summary = extract("npm WARN deprecated package\n", "", 0);
+        assert_eq!(summary.warning_count, 1);
+    }
+
+    #[test]
+    fn redacts_secrets_from_summary_signals() {
+        let output = "\
+error: token=sk-testabcdefghijklmnopqrstuvwxyz
+Authorization: Bearer abcdefghijklmnopqrstuvwxyz
+fatal: https://user:password@example.com/repo.git failed
+";
+        let summary = extract("", output, 1);
+        let rendered = format!(
+            "{}\n{}",
+            summary.top_errors.join("\n"),
+            summary.tail.join("\n")
+        );
+        assert!(!rendered.contains("sk-testabcdefghijklmnopqrstuvwxyz"));
+        assert!(!rendered.contains("abcdefghijklmnopqrstuvwxyz"));
+        assert!(!rendered.contains("user:password"));
+        assert!(rendered.contains("token=[redacted]"));
+        assert!(rendered.contains("Authorization: [redacted]"));
+        assert!(rendered.contains("https://[redacted]@example.com/repo.git"));
+    }
+
+    #[test]
+    fn redacts_sensitive_argv_values() {
+        let argv = vec![
+            "deploy".to_string(),
+            "--token".to_string(),
+            "secret-value".to_string(),
+            "--api-key=abc123".to_string(),
+            "Authorization: Bearer abcdefghijklmnopqrstuvwxyz".to_string(),
+        ];
+        let redacted = redact_argv(&argv);
+        assert_eq!(redacted[2], "[redacted]");
+        assert_eq!(redacted[3], "--api-key=[redacted]");
+        assert_eq!(redacted[4], "Authorization: [redacted]");
+
+        let line = redact_sensitive_text("deploy --token SECRET_CANARY_PATH_LEAK --api-key=abc123");
+        assert!(!line.contains("SECRET_CANARY_PATH_LEAK"));
+        assert!(!line.contains("abc123"));
+        assert_eq!(line, "deploy --token [redacted] --api-key=[redacted]");
     }
 }

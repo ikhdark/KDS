@@ -12,3 +12,8 @@ raw logs before sharing them.
 
 KDS summary, evidence, gain, doctor, and log-index commands are designed not to
 print raw stdout/stderr bodies by default.
+
+KDS redacts common token, API key, password, bearer-token, and URL credential
+patterns from summaries, evidence, sidecars, and indexes. Raw logs and `kds raw`
+output are not redacted. Treat redaction as a guardrail, not as proof that
+every possible secret-like value was removed.

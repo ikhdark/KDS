@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const SUMMARY_SCHEMA_VERSION: u32 = 1;
 pub const INDEX_SCHEMA_VERSION: u32 = 1;
@@ -318,10 +319,10 @@ pub fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
-    let tmp = path.with_extension(format!(
-        "{}.tmp",
-        path.extension().and_then(|e| e.to_str()).unwrap_or("json")
-    ));
+    let tmp = tmp_path(
+        path,
+        path.extension().and_then(|e| e.to_str()).unwrap_or("json"),
+    );
     let text = serde_json::to_string_pretty(value)?;
     fs::write(&tmp, text).with_context(|| format!("write {}", tmp.display()))?;
     fs::rename(&tmp, path)
@@ -333,14 +334,26 @@ pub fn write_text_atomic(path: &Path, text: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
-    let tmp = path.with_extension(format!(
-        "{}.tmp",
-        path.extension().and_then(|e| e.to_str()).unwrap_or("txt")
-    ));
+    let tmp = tmp_path(
+        path,
+        path.extension().and_then(|e| e.to_str()).unwrap_or("txt"),
+    );
     fs::write(&tmp, text).with_context(|| format!("write {}", tmp.display()))?;
     fs::rename(&tmp, path)
         .with_context(|| format!("rename {} to {}", tmp.display(), path.display()))?;
     Ok(())
+}
+
+fn tmp_path(path: &Path, fallback_extension: &str) -> PathBuf {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    path.with_extension(format!(
+        "{fallback_extension}.{}.{}.tmp",
+        std::process::id(),
+        unique
+    ))
 }
 
 fn make_run_id(argv: &[String], cwd: &Path, started: DateTime<Local>) -> String {

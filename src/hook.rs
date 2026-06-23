@@ -73,7 +73,22 @@ pub fn install_powershell_hook() -> Result<i32> {
 
 pub fn uninstall_powershell_hook() -> Result<i32> {
     let profile = powershell_profile_path();
-    let current = fs::read_to_string(&profile).unwrap_or_default();
+    let current = match fs::read_to_string(&profile) {
+        Ok(current) => current,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            println!("No KDS PowerShell hook found:");
+            println!("{}", profile.display());
+            return Ok(0);
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("read {}", profile.display()));
+        }
+    };
+    if !has_block(&current) {
+        println!("No KDS PowerShell hook found:");
+        println!("{}", profile.display());
+        return Ok(0);
+    }
     let updated = remove_block(&current);
     storage::write_text_atomic(&profile, &updated)?;
     println!("Removed KDS PowerShell hook:");
@@ -101,12 +116,33 @@ fn hook_block() -> Result<String> {
 $script:KdsExe = '{exe}'
 function _kds_native {{
   param([string]$Name)
-  $candidates = @("$Name.exe", "$Name.cmd", "$Name.ps1", $Name)
-  foreach ($candidate in $candidates) {{
-    $cmd = Get-Command $candidate -CommandType Application,ExternalScript -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($cmd) {{ return $cmd.Source }}
-  }}
+  $cmd = Get-Command $Name -CommandType Application,ExternalScript -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($cmd) {{ return $cmd.Source }}
   return $Name
+}}
+function _kds_restore_args {{
+  param([object[]]$Rest, [string]$Statement)
+  $out = [System.Collections.Generic.List[object]]::new()
+  foreach ($arg in $Rest) {{ [void]$out.Add($arg) }}
+  $errors = $null
+  $tokens = [System.Management.Automation.PSParser]::Tokenize($Statement, [ref]$errors)
+  $seenCommand = $false
+  $argIndex = 0
+  foreach ($token in $tokens) {{
+    if (-not $seenCommand) {{
+      if ($token.Type -eq 'Command') {{ $seenCommand = $true }}
+      continue
+    }}
+    if ($token.Type -eq 'CommandArgument' -or $token.Type -eq 'String') {{
+      $argIndex += 1
+    }} elseif ($token.Type -eq 'Operator' -and $token.Content -eq '--') {{
+      if ($argIndex -le $out.Count) {{
+        $out.Insert($argIndex, '--')
+        $argIndex += 1
+      }}
+    }}
+  }}
+  return $out.ToArray()
 }}
 function _kds_call_native {{
   param([string]$Name, [object[]]$Rest)
@@ -117,22 +153,37 @@ function _kds_wrap {{
   param([string]$Name, [object[]]$Rest)
   & $script:KdsExe -- $Name @Rest
 }}
-function cargo {{
-  if ($args.Count -gt 0 -and @('check','test','build','clippy') -contains $args[0]) {{ _kds_wrap 'cargo' $args }} else {{ _kds_call_native 'cargo' $args }}
+function _kds_safe_task {{
+  param([string]$Name)
+  return @('test','build','check','lint','typecheck','ci','clippy') -contains $Name
 }}
-function just {{ _kds_wrap 'just' $args }}
+function cargo {{
+  $rest = @(_kds_restore_args $args $MyInvocation.Statement)
+  if ($rest.Count -gt 0 -and @('check','test','build','clippy') -contains $rest[0]) {{ _kds_wrap 'cargo' $rest }} else {{ _kds_call_native 'cargo' $rest }}
+}}
+function just {{
+  $rest = @(_kds_restore_args $args $MyInvocation.Statement)
+  if ($rest.Count -gt 0 -and (_kds_safe_task $rest[0])) {{ _kds_wrap 'just' $rest }} else {{ _kds_call_native 'just' $rest }}
+}}
 function npm {{
-  if ($args.Count -gt 0 -and @('test','run') -contains $args[0]) {{ _kds_wrap 'npm' $args }} else {{ _kds_call_native 'npm' $args }}
+  $rest = @(_kds_restore_args $args $MyInvocation.Statement)
+  if ($rest.Count -gt 0 -and $rest[0] -eq 'test') {{ _kds_wrap 'npm' $rest }} elseif ($rest.Count -ge 2 -and $rest[0] -eq 'run' -and (_kds_safe_task $rest[1])) {{ _kds_wrap 'npm' $rest }} else {{ _kds_call_native 'npm' $rest }}
 }}
 function pnpm {{
-  if ($args.Count -gt 0 -and @('test','run') -contains $args[0]) {{ _kds_wrap 'pnpm' $args }} else {{ _kds_call_native 'pnpm' $args }}
+  $rest = @(_kds_restore_args $args $MyInvocation.Statement)
+  if ($rest.Count -gt 0 -and $rest[0] -eq 'test') {{ _kds_wrap 'pnpm' $rest }} elseif ($rest.Count -ge 2 -and $rest[0] -eq 'run' -and (_kds_safe_task $rest[1])) {{ _kds_wrap 'pnpm' $rest }} else {{ _kds_call_native 'pnpm' $rest }}
 }}
-function pytest {{ _kds_wrap 'pytest' $args }}
+function pytest {{
+  $rest = @(_kds_restore_args $args $MyInvocation.Statement)
+  _kds_wrap 'pytest' $rest
+}}
 function python {{
-  if ($args.Count -ge 2 -and $args[0] -eq '-m' -and $args[1] -eq 'pytest') {{ _kds_wrap 'python' $args }} else {{ _kds_call_native 'python' $args }}
+  $rest = @(_kds_restore_args $args $MyInvocation.Statement)
+  if ($rest.Count -ge 2 -and $rest[0] -eq '-m' -and $rest[1] -eq 'pytest') {{ _kds_wrap 'python' $rest }} else {{ _kds_call_native 'python' $rest }}
 }}
 function git {{
-  if ($args.Count -gt 0 -and @('status','diff','log') -contains $args[0]) {{ _kds_wrap 'git' $args }} else {{ _kds_call_native 'git' $args }}
+  $rest = @(_kds_restore_args $args $MyInvocation.Statement)
+  if ($rest.Count -gt 0 -and @('status') -contains $rest[0]) {{ _kds_wrap 'git' $rest }} else {{ _kds_call_native 'git' $rest }}
 }}
 {END}
 "#
@@ -150,8 +201,7 @@ fn upsert_block(current: &str, block: &str) -> String {
 }
 
 fn remove_block(current: &str) -> String {
-    if let (Some(start), Some(end_start)) = (current.find(START), current.find(END)) {
-        let end = end_start + END.len();
+    if let Some((start, end)) = block_bounds(current) {
         let mut out = String::new();
         out.push_str(current[..start].trim_end());
         out.push('\n');
@@ -161,9 +211,21 @@ fn remove_block(current: &str) -> String {
     current.to_string()
 }
 
+fn has_block(current: &str) -> bool {
+    block_bounds(current).is_some()
+}
+
+fn block_bounds(current: &str) -> Option<(usize, usize)> {
+    let start = current.find(START)?;
+    let end_start = current[start..].find(END)? + start;
+    Some((start, end_start + END.len()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use std::process::Command;
 
     #[test]
     fn hook_block_is_managed_and_removable() {
@@ -175,5 +237,173 @@ mod tests {
         let removed = remove_block(&with);
         assert!(removed.contains("before"));
         assert!(!removed.contains("# kds-hook-start"));
+    }
+
+    #[test]
+    fn remove_block_noops_when_managed_block_is_absent() {
+        let original = "before\n";
+        assert!(!has_block(original));
+        assert_eq!(remove_block(original), original);
+    }
+
+    #[test]
+    fn remove_block_ignores_reversed_markers() {
+        let original = "# kds-hook-end\nbefore\n# kds-hook-start\n";
+        assert!(!has_block(original));
+        assert_eq!(remove_block(original), original);
+    }
+
+    #[test]
+    fn powershell_hook_preserves_bare_double_dash() {
+        if !cfg!(windows) {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let fake_cargo = dir.path().join("cargo.cmd");
+        let fake_git = dir.path().join("git.cmd");
+        let fake_just = dir.path().join("just.cmd");
+        let fake_npm = dir.path().join("npm.cmd");
+        let fake_pnpm = dir.path().join("pnpm.cmd");
+        let fake_kds = dir.path().join("kds.cmd");
+        std::fs::write(
+            &fake_cargo,
+            "@echo off\r\n:loop\r\nif \"%~1\"==\"\" goto end\r\necho [%~1]\r\nshift\r\ngoto loop\r\n:end\r\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &fake_git,
+            "@echo off\r\n:loop\r\nif \"%~1\"==\"\" goto end\r\necho [%~1]\r\nshift\r\ngoto loop\r\n:end\r\n",
+        )
+        .unwrap();
+        for fake in [&fake_just, &fake_npm, &fake_pnpm] {
+            std::fs::write(
+                fake,
+                "@echo off\r\n:loop\r\nif \"%~1\"==\"\" goto end\r\necho native:[%~1]\r\nshift\r\ngoto loop\r\n:end\r\n",
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            &fake_kds,
+            "@echo off\r\n:loop\r\nif \"%~1\"==\"\" goto end\r\necho kds:[%~1]\r\nshift\r\ngoto loop\r\n:end\r\n",
+        )
+        .unwrap();
+
+        let script_path = dir.path().join("test.ps1");
+        let mut script = std::fs::File::create(&script_path).unwrap();
+        write!(
+            script,
+            r#"
+{}
+$env:PATH = '{};' + $env:PATH
+$script:KdsExe = '{}'
+"native"
+cargo run -- --help
+"wrapped"
+cargo test -- --nocapture
+"git-status"
+git status --short
+"git-diff"
+git diff --exit-code
+"npm-test"
+npm test
+"npm-run-test"
+npm run test
+"npm-run-deploy"
+npm run deploy
+"pnpm-run-build"
+pnpm run build
+"pnpm-run-deploy"
+pnpm run deploy
+"just-test"
+just test
+"just-deploy"
+just deploy
+"#,
+            hook_block().unwrap(),
+            dir.path().display(),
+            fake_kds.display()
+        )
+        .unwrap();
+        drop(script);
+
+        let output = match Command::new("pwsh")
+            .arg("-NoProfile")
+            .arg("-ExecutionPolicy")
+            .arg("Bypass")
+            .arg("-File")
+            .arg(&script_path)
+            .output()
+        {
+            Ok(output) => output,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+            Err(err) => panic!("run pwsh: {err}"),
+        };
+
+        assert!(
+            output.status.success(),
+            "stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("native\r\n[run]\r\n[--]\r\n[--help]")
+                || stdout.contains("native\n[run]\n[--]\n[--help]"),
+            "stdout:\n{stdout}"
+        );
+        assert!(
+            stdout.contains(
+                "wrapped\r\nkds:[--]\r\nkds:[cargo]\r\nkds:[test]\r\nkds:[--]\r\nkds:[--nocapture]"
+            ) || stdout.contains(
+                "wrapped\nkds:[--]\nkds:[cargo]\nkds:[test]\nkds:[--]\nkds:[--nocapture]"
+            ),
+            "stdout:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("git-status\r\nkds:[--]\r\nkds:[git]\r\nkds:[status]\r\nkds:[--short]")
+                || stdout.contains("git-status\nkds:[--]\nkds:[git]\nkds:[status]\nkds:[--short]"),
+            "stdout:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("git-diff\r\n[diff]\r\n[--exit-code]")
+                || stdout.contains("git-diff\n[diff]\n[--exit-code]"),
+            "stdout:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("npm-test\r\nkds:[--]\r\nkds:[npm]\r\nkds:[test]")
+                || stdout.contains("npm-test\nkds:[--]\nkds:[npm]\nkds:[test]"),
+            "stdout:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("npm-run-test\r\nkds:[--]\r\nkds:[npm]\r\nkds:[run]\r\nkds:[test]")
+                || stdout.contains("npm-run-test\nkds:[--]\nkds:[npm]\nkds:[run]\nkds:[test]"),
+            "stdout:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("npm-run-deploy\r\nnative:[run]\r\nnative:[deploy]")
+                || stdout.contains("npm-run-deploy\nnative:[run]\nnative:[deploy]"),
+            "stdout:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("pnpm-run-build\r\nkds:[--]\r\nkds:[pnpm]\r\nkds:[run]\r\nkds:[build]")
+                || stdout.contains("pnpm-run-build\nkds:[--]\nkds:[pnpm]\nkds:[run]\nkds:[build]"),
+            "stdout:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("pnpm-run-deploy\r\nnative:[run]\r\nnative:[deploy]")
+                || stdout.contains("pnpm-run-deploy\nnative:[run]\nnative:[deploy]"),
+            "stdout:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("just-test\r\nkds:[--]\r\nkds:[just]\r\nkds:[test]")
+                || stdout.contains("just-test\nkds:[--]\nkds:[just]\nkds:[test]"),
+            "stdout:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("just-deploy\r\nnative:[deploy]")
+                || stdout.contains("just-deploy\nnative:[deploy]"),
+            "stdout:\n{stdout}"
+        );
     }
 }

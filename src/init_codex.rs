@@ -57,7 +57,20 @@ pub fn codex_home() -> PathBuf {
 }
 
 fn uninstall(agents: &PathBuf, dry_run: bool) -> Result<i32> {
-    let current = fs::read_to_string(agents).unwrap_or_default();
+    let current = match fs::read_to_string(agents) {
+        Ok(current) => current,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            println!("No KDS Codex block found in: {}", agents.display());
+            return Ok(0);
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("read {}", agents.display()));
+        }
+    };
+    if !has_block(&current) {
+        println!("No KDS Codex block found in: {}", agents.display());
+        return Ok(0);
+    }
     let updated = remove_block(&current);
     if dry_run {
         println!("KDS Codex uninstall dry run");
@@ -83,8 +96,7 @@ fn upsert_block(current: &str) -> String {
 }
 
 fn remove_block(current: &str) -> String {
-    if let (Some(start), Some(end_start)) = (current.find(START), current.find(END)) {
-        let end = end_start + END.len();
+    if let Some((start, end)) = block_bounds(current) {
         let mut out = String::new();
         out.push_str(current[..start].trim_end());
         out.push('\n');
@@ -92,6 +104,16 @@ fn remove_block(current: &str) -> String {
         return out.trim_matches('\n').to_string() + "\n";
     }
     current.to_string()
+}
+
+fn has_block(current: &str) -> bool {
+    block_bounds(current).is_some()
+}
+
+fn block_bounds(current: &str) -> Option<(usize, usize)> {
+    let start = current.find(START)?;
+    let end_start = current[start..].find(END)? + start;
+    Some((start, end_start + END.len()))
 }
 
 fn backup_existing(path: &PathBuf) -> Result<Option<PathBuf>> {
@@ -157,5 +179,19 @@ mod tests {
         let removed = remove_block(&twice);
         assert!(removed.contains("before"));
         assert!(!removed.contains("@KDS.md"));
+    }
+
+    #[test]
+    fn remove_block_noops_when_managed_block_is_absent() {
+        let original = "before\n";
+        assert!(!has_block(original));
+        assert_eq!(remove_block(original), original);
+    }
+
+    #[test]
+    fn remove_block_ignores_reversed_markers() {
+        let original = "<!-- /kds-instructions -->\nbefore\n<!-- kds-instructions -->\n";
+        assert!(!has_block(original));
+        assert_eq!(remove_block(original), original);
     }
 }

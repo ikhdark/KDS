@@ -59,6 +59,10 @@ share raw logs without reviewing and redacting them.
 `kds gain`, `kds doctor`, `kds logs last`, default `kds logs show <id>`, and
 `kds evidence last` do not print raw stdout/stderr bodies.
 
+KDS redacts common token, API key, password, bearer-token, and URL credential
+patterns from summaries, evidence, sidecars, and indexes. This is a safety
+guardrail, not a guarantee that every possible secret-like value is removed.
+
 ## When Not To Use KDS
 
 Do not use KDS for interactive commands, password prompts, SSH sessions,

@@ -34,9 +34,11 @@ pub fn run(argv: Vec<String>, mode: Mode) -> Result<i32> {
 
     let cwd = std::env::current_dir()?;
     let started = Local::now();
-    let paths = Paths::discover()?;
-    let run_paths = paths.prepare_run_paths(&argv, &cwd, started)?;
     let command = storage::command_string(&argv);
+    let safe_command = summarize::redact_sensitive_text(&command);
+    let safe_argv = summarize::redact_argv(&argv);
+    let paths = Paths::discover()?;
+    let run_paths = paths.prepare_run_paths(&safe_argv, &cwd, started)?;
     let command_kind = storage::command_kind(&argv);
 
     let begin = Instant::now();
@@ -73,8 +75,14 @@ pub fn run(argv: Vec<String>, mode: Mode) -> Result<i32> {
     let raw_total_lines = raw_stdout_lines + raw_stderr_lines;
     let extracted = summarize::extract(&stdout, &stderr, exit_code);
     let cwd_string = cwd.display().to_string();
-    let digest = digest::make_digest(&command_kind, &command, &cwd_string, exit_code, &extracted);
-    let previous_match = storage::previous_exact_match(&paths, &argv, &cwd_string);
+    let digest = digest::make_digest(
+        &command_kind,
+        &safe_command,
+        &cwd_string,
+        exit_code,
+        &extracted,
+    );
+    let previous_match = storage::previous_exact_match(&paths, &safe_argv, &cwd_string);
     let previous_sidecar = previous_match.as_ref().and_then(|previous| {
         storage::read_sidecar(PathBuf::from(&previous.summary_path).as_path()).ok()
     });
@@ -102,7 +110,7 @@ pub fn run(argv: Vec<String>, mode: Mode) -> Result<i32> {
     let repeat_status = match digest::update_repeat_state(
         &paths,
         &digest,
-        &command,
+        &safe_command,
         &cwd_string,
         exit_code,
         &run_paths.log_path,
@@ -127,8 +135,8 @@ pub fn run(argv: Vec<String>, mode: Mode) -> Result<i32> {
         kds_version: env!("CARGO_PKG_VERSION").to_string(),
         run_id: run_paths.run_id.clone(),
         summary_path: run_paths.summary_path.display().to_string(),
-        command: command.clone(),
-        argv: argv.clone(),
+        command: safe_command.clone(),
+        argv: safe_argv.clone(),
         cwd: cwd_string.clone(),
         mode: mode.as_str().to_string(),
         exit_code,
@@ -176,8 +184,8 @@ pub fn run(argv: Vec<String>, mode: Mode) -> Result<i32> {
         summary_path: run_paths.summary_path.display().to_string(),
         exit_code,
         command_kind,
-        command,
-        argv,
+        command: safe_command,
+        argv: safe_argv,
         cwd: cwd_string,
         started_at: sidecar.started_at.clone(),
         log_path: run_paths.log_path.display().to_string(),
