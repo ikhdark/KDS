@@ -21,8 +21,14 @@ Dry-run:
 
 ## Linux/macOS
 
+Unix shell hooks are not implemented in V1, so the Unix script is not a
+product-style activated installer. For development or explicit manual use
+without automatic hook activation:
+
 ```sh
-./scripts/install.sh
+./scripts/install.sh --binary-only
 ```
 
-The installer builds KDS locally and installs to `$HOME/.local/bin`.
+The helper builds KDS locally and installs to `$HOME/.local/bin`. Running
+`./scripts/install.sh` without `--binary-only` refuses to install because KDS
+install is automatic-hook-first.

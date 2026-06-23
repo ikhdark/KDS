@@ -20,9 +20,9 @@ scope, and it does not depend on RTK.
 
 ## Quick Start
 
+From a KDS source checkout:
+
 ```powershell
-git clone https://github.com/kds-ai/kds
-Set-Location kds
 .\scripts\install.ps1
 kds doctor
 ```

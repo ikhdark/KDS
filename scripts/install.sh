@@ -6,20 +6,22 @@ show_help() {
 KDS Unix installer
 
 Usage:
-  ./scripts/install.sh [--dry-run] [--help]
+  ./scripts/install.sh [--binary-only] [--dry-run] [--help]
 
 Behavior:
-  - builds KDS from this repository
-  - installs kds to $HOME/.local/bin
+  - Unix automatic shell hooks are not implemented in V1
+  - refuses product-style install unless --binary-only is explicit
+  - with --binary-only, builds KDS and installs kds to $HOME/.local/bin
   - does not silently edit PATH
   - does not modify Codex config
-  - shell hooks are Windows PowerShell-only in V1
 EOF
 }
 
 dry_run=0
+binary_only=0
 for arg in "$@"; do
   case "$arg" in
+    --binary-only) binary_only=1 ;;
     --dry-run) dry_run=1 ;;
     --help|-h) show_help; exit 0 ;;
     *) echo "unknown argument: $arg" >&2; exit 2 ;;
@@ -35,10 +37,17 @@ echo "KDS install plan"
 echo "Repository: $repo"
 echo "Install directory: $install_dir"
 echo "Binary: $target"
+echo "Automatic hook: unavailable on Unix in V1"
 
 if [ "$dry_run" -eq 1 ]; then
   echo "Dry run: no binary copy, no hook/profile edit, no Codex config edit, no PATH edit."
   exit 0
+fi
+
+if [ "$binary_only" -ne 1 ]; then
+  echo "Refusing install: KDS install is automatic-hook-first, and Unix shell hooks are not implemented in V1." >&2
+  echo "Use --binary-only only for development or explicit manual use without activation." >&2
+  exit 2
 fi
 
 (cd "$repo" && cargo build --release)

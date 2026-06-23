@@ -197,7 +197,7 @@ fn known_secret_re() -> &'static Regex {
     static KNOWN_SECRET_RE: OnceLock<Regex> = OnceLock::new();
     KNOWN_SECRET_RE.get_or_init(|| {
         Regex::new(
-            r"\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16})\b",
+            r"\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{20,}|sk-[A-Za-z0-9_-]{20,}|(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}|AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{30,}|xox(?:b|p|a|r|s)-[A-Za-z0-9-]{10,}|npm_[A-Za-z0-9]{20,}|[A-Za-z0-9_-]{23,28}\.[A-Za-z0-9_-]{6,10}\.[A-Za-z0-9_-]{27,}|eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})\b",
         )
         .unwrap()
     })
@@ -406,6 +406,9 @@ mod tests {
 error: token=sk-testabcdefghijklmnopqrstuvwxyz
 Authorization: Bearer abcdefghijklmnopqrstuvwxyz
 fatal: https://user:password@example.com/repo.git failed
+slack=xoxb-123456789012-123456789012-abcdefghijklmnopqrstuvwx
+google=AIzaSyB123456789012345678901234567890123
+jwt=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.sflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c
 ";
         let summary = extract("", output, 1);
         let rendered = format!(
@@ -419,6 +422,9 @@ fatal: https://user:password@example.com/repo.git failed
         assert!(rendered.contains("token=[redacted]"));
         assert!(rendered.contains("Authorization: [redacted]"));
         assert!(rendered.contains("https://[redacted]@example.com/repo.git"));
+        assert!(!rendered.contains("xoxb-123456789012"));
+        assert!(!rendered.contains("AIzaSyB123456"));
+        assert!(!rendered.contains("eyJhbGciOiJIUzI1NiJ9"));
     }
 
     #[test]

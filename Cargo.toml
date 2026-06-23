@@ -4,7 +4,6 @@ version = "0.1.0"
 edition = "2021"
 description = "KD Savings: compact command evidence and local log drilldown"
 license = "MIT"
-repository = "https://github.com/kds-ai/kds"
 
 [dependencies]
 anyhow = "1"

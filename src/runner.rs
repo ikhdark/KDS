@@ -1,6 +1,5 @@
 use anyhow::Result;
 use chrono::Local;
-use std::path::PathBuf;
 use std::process::Command;
 use std::time::Instant;
 
@@ -83,10 +82,11 @@ pub fn run(argv: Vec<String>, mode: Mode) -> Result<i32> {
         exit_code,
         &extracted,
     );
-    let previous_match = storage::previous_exact_match(&paths, &safe_argv, &cwd_string);
-    let previous_sidecar = previous_match.as_ref().and_then(|previous| {
-        storage::read_sidecar(PathBuf::from(&previous.summary_path).as_path()).ok()
-    });
+    let (previous_match, previous_sidecar) =
+        match storage::previous_exact_match_with_sidecar(&paths, &safe_argv, &cwd_string) {
+            Some((previous_match, previous_sidecar)) => (Some(previous_match), previous_sidecar),
+            None => (None, None),
+        };
     let delta = summarize::delta_line(
         previous_sidecar.as_ref(),
         &extracted,

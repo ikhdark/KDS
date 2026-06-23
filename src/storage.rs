@@ -358,23 +358,26 @@ pub fn last_run(paths: &Paths) -> Result<IndexEntry> {
         .context("no KDS runs found")
 }
 
-pub fn previous_exact_match(
+pub fn previous_exact_match_with_sidecar(
     paths: &Paths,
     argv: &[String],
     cwd: &str,
-) -> Option<PreviousExactMatchRun> {
-    read_index(paths)
+) -> Option<(PreviousExactMatchRun, Option<SummarySidecar>)> {
+    let entry = read_index(paths)
         .into_iter()
         .rev()
-        .find(|entry| entry.argv == argv && entry.cwd == cwd)
-        .map(|entry| PreviousExactMatchRun {
-            run_id: entry.run_id,
-            exit_code: entry.exit_code,
-            digest: read_sidecar(Path::new(&entry.summary_path))
-                .map(|sidecar| sidecar.digest)
-                .unwrap_or_default(),
-            summary_path: entry.summary_path,
-        })
+        .find(|entry| entry.argv == argv && entry.cwd == cwd)?;
+    let sidecar = read_sidecar(Path::new(&entry.summary_path)).ok();
+    let previous = PreviousExactMatchRun {
+        run_id: entry.run_id,
+        exit_code: entry.exit_code,
+        digest: sidecar
+            .as_ref()
+            .map(|sidecar| sidecar.digest.clone())
+            .unwrap_or_default(),
+        summary_path: entry.summary_path,
+    };
+    Some((previous, sidecar))
 }
 
 pub fn load_metrics(paths: &Paths) -> Metrics {
