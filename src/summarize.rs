@@ -1,5 +1,4 @@
 use regex::Regex;
-use serde_json::Value;
 use std::collections::VecDeque;
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -78,33 +77,29 @@ struct SummaryBuilder {
     warning_count: usize,
     error_count: usize,
     top_errors: Vec<String>,
-    top_warnings: Vec<String>,
     file_hits: Vec<String>,
     tail: VecDeque<String>,
 }
 
 impl SummaryBuilder {
     fn push_line(&mut self, raw_line: &str) {
-        let stripped = strip_ansi(raw_line);
-        let normalized = normalize_structured_log_line(&stripped).unwrap_or(stripped);
-        let line = redact_sensitive_text(&normalized).trim_end().to_string();
+        let line = redact_sensitive_text(&strip_ansi(raw_line))
+            .trim_end()
+            .to_string();
         let lower = line.to_ascii_lowercase();
-        let is_warning = lower.contains("warning:")
+        if lower.contains("warning:")
             || lower.starts_with("warn ")
             || lower.starts_with("npm warn ")
-            || lower.contains(" npm warn ");
-        if is_warning {
+            || lower.contains(" npm warn ")
+        {
             self.warning_count += 1;
         }
-        let is_error = is_error_line(&line);
-        if is_error {
+        if is_error_line(&line) {
             self.error_count += 1;
         }
         if !line.trim().is_empty() {
-            if is_error {
+            if is_error_line(&line) {
                 push_unique_cap(&mut self.top_errors, line.clone(), 8);
-            } else if is_warning {
-                push_unique_cap(&mut self.top_warnings, line.clone(), 8);
             }
             for hit in extract_file_hits(&line, 10) {
                 push_unique_cap(&mut self.file_hits, hit, 10);
@@ -117,9 +112,6 @@ impl SummaryBuilder {
     }
 
     fn finish(mut self, exit_code: i32) -> ExtractedSummary {
-        if self.top_errors.is_empty() && exit_code != 0 && !self.top_warnings.is_empty() {
-            self.top_errors = self.top_warnings.clone();
-        }
         if self.top_errors.is_empty() && exit_code != 0 {
             for line in self
                 .tail
@@ -146,33 +138,6 @@ impl SummaryBuilder {
             suggested_next_reads,
         }
     }
-}
-
-fn normalize_structured_log_line(line: &str) -> Option<String> {
-    let trimmed = line.trim();
-    let json = if trimmed.starts_with('{') {
-        trimmed
-    } else if let Some(rest) = trimmed.strip_prefix("Most recent error:") {
-        rest.trim()
-    } else {
-        return None;
-    };
-    if !json.starts_with('{') {
-        return None;
-    }
-
-    let value: Value = serde_json::from_str(json).ok()?;
-    let level = value.get("level")?.as_str()?.to_ascii_uppercase();
-    let message = value
-        .pointer("/fields/message")
-        .and_then(Value::as_str)
-        .or_else(|| value.get("message").and_then(Value::as_str))?;
-    let target = value.get("target").and_then(Value::as_str);
-
-    Some(match target {
-        Some(target) if !target.is_empty() => format!("{level} {target}: {message}"),
-        _ => format!("{level}: {message}"),
-    })
 }
 
 fn strip_ansi(text: &str) -> String {
@@ -635,37 +600,6 @@ mod tests {
     fn counts_npm_warnings_at_line_start() {
         let summary = extract("npm WARN deprecated package\n", "", 0);
         assert_eq!(summary.warning_count, 1);
-    }
-
-    #[test]
-    fn structured_warn_json_is_not_promoted_by_most_recent_error_prefix() {
-        let output = r#"Most recent error: {"timestamp":"2026-06-23T08:14:40.156354Z","level":"WARN","fields":{"message":"state db codex_home mismatch: expected C:\\Users\\kuh.codex-kd-local\\sqlite, got C:\\Users\\kuh\\Desktop\\LOCAL-KD"},"target":"codex_rollout::state_db"}"#;
-        let summary = extract("(code=4294967295, signal=null).\n", output, 1);
-
-        assert_eq!(summary.warning_count, 1);
-        assert_eq!(summary.error_count, 0);
-        assert_eq!(summary.primary_failure.as_deref(), Some("WARN codex_rollout::state_db: state db codex_home mismatch: expected C:\\Users\\kuh.codex-kd-local\\sqlite, got C:\\Users\\kuh\\Desktop\\LOCAL-KD"));
-        let rendered = summary.top_errors.join("\n");
-        assert!(
-            !rendered.contains("Most recent error:"),
-            "rendered:\n{rendered}"
-        );
-        assert!(
-            !rendered.contains("\"level\":\"WARN\""),
-            "rendered:\n{rendered}"
-        );
-    }
-
-    #[test]
-    fn structured_error_json_becomes_clean_error_signal() {
-        let output = r#"{"timestamp":"2026-06-23T08:14:40.156354Z","level":"ERROR","fields":{"message":"command failed"},"target":"codex_rollout::exec"}"#;
-        let summary = extract("", output, 1);
-
-        assert_eq!(summary.error_count, 1);
-        assert_eq!(
-            summary.primary_failure.as_deref(),
-            Some("ERROR codex_rollout::exec: command failed")
-        );
     }
 
     #[test]
