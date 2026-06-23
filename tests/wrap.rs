@@ -56,7 +56,7 @@ fn wraps_real_command_and_writes_local_run_artifacts() {
 
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("KDS ran -\n"), "stdout:\n{stdout}");
+    assert!(stdout.starts_with("KDS\n"), "stdout:\n{stdout}");
     assert!(stdout.contains("Exit code: 0"), "stdout:\n{stdout}");
     assert!(stdout.contains("Summary: success"), "stdout:\n{stdout}");
     assert!(
@@ -179,7 +179,7 @@ fn wraps_windows_pathext_cmd_shim_end_to_end() {
 
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("KDS ran -\n"), "stdout:\n{stdout}");
+    assert!(stdout.starts_with("KDS\n"), "stdout:\n{stdout}");
     assert!(stdout.contains("Exit code: 0"), "stdout:\n{stdout}");
 
     let logs = collect_files(&kds_home.path().join("logs"), "log");
