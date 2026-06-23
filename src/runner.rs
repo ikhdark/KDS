@@ -1,6 +1,9 @@
 use anyhow::Result;
 use chrono::Local;
-use std::process::Command;
+use std::fs;
+use std::io::{self, Read, Write};
+use std::process::{Command, Stdio};
+use std::thread;
 use std::time::Instant;
 
 use crate::digest;
@@ -25,7 +28,7 @@ impl Mode {
     }
 }
 
-pub fn run(argv: Vec<String>, mode: Mode) -> Result<i32> {
+pub fn run(argv: Vec<String>, mode: Mode, show_paths: bool) -> Result<i32> {
     if argv.is_empty() {
         eprintln!("kds: no wrapped command provided");
         return Ok(2);
@@ -36,25 +39,61 @@ pub fn run(argv: Vec<String>, mode: Mode) -> Result<i32> {
     let command = storage::command_string(&argv);
     let safe_command = summarize::redact_sensitive_text(&command);
     let safe_argv = summarize::redact_argv(&argv);
+    let safe_command_identity = storage::command_identity(&safe_argv);
     let paths = Paths::discover()?;
     let run_paths = paths.prepare_run_paths(&safe_argv, &cwd, started)?;
     let command_kind = storage::command_kind(&argv);
     let program = storage::resolve_command(&argv[0]);
+    let raw_byte_limit = raw_byte_limit();
+
+    let (stdout_temp_path, stdout_temp_file) =
+        storage::create_temp_file_near(&run_paths.log_path, "stdout")?;
+    let (stderr_temp_path, stderr_temp_file) =
+        storage::create_temp_file_near(&run_paths.log_path, "stderr")?;
+    let _temp_cleanup = TempFileCleanup(vec![stdout_temp_path.clone(), stderr_temp_path.clone()]);
 
     let begin = Instant::now();
-    let output = Command::new(&program).args(&argv[1..]).output();
-    let elapsed_duration = begin.elapsed();
-    let elapsed = format_elapsed(elapsed_duration.as_millis());
+    let child = Command::new(&program)
+        .args(&argv[1..])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
 
-    let output = match output {
-        Ok(output) => output,
+    let mut child = match child {
+        Ok(child) => child,
         Err(err) => {
             eprintln!("kds: failed to run `{command}`: {err}");
+            let _ = fs::remove_file(&stdout_temp_path);
+            let _ = fs::remove_file(&stderr_temp_path);
             return Ok(1);
         }
     };
 
-    let exit_code = match output.status.code() {
+    let stdout = child
+        .stdout
+        .take()
+        .expect("child stdout was piped but unavailable");
+    let stderr = child
+        .stderr
+        .take()
+        .expect("child stderr was piped but unavailable");
+    let stdout_reader = spawn_pipe_copy(stdout, stdout_temp_file, raw_byte_limit);
+    let stderr_reader = spawn_pipe_copy(stderr, stderr_temp_file, raw_byte_limit);
+
+    let status = child.wait()?;
+    let stdout_capture = join_pipe_copy("stdout", stdout_reader).unwrap_or_else(|err| {
+        eprintln!("kds: stdout capture failed: {err:#}");
+        PipeCapture::default()
+    });
+    let stderr_capture = join_pipe_copy("stderr", stderr_reader).unwrap_or_else(|err| {
+        eprintln!("kds: stderr capture failed: {err:#}");
+        PipeCapture::default()
+    });
+
+    let elapsed_duration = begin.elapsed();
+    let elapsed = format_elapsed(elapsed_duration.as_millis());
+
+    let exit_code = match status.code() {
         Some(code) => code,
         None => {
             eprintln!("kds: wrapped command did not provide a normal exit code; exiting 1");
@@ -62,22 +101,30 @@ pub fn run(argv: Vec<String>, mode: Mode) -> Result<i32> {
         }
     };
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
     if mode == Mode::Raw {
-        print!("{stdout}");
-        eprint!("{stderr}");
+        if let Err(err) = copy_file_to_stdout(&stdout_temp_path) {
+            eprintln!("kds: raw stdout replay failed: {err:#}");
+        }
+        if let Err(err) = copy_file_to_stderr(&stderr_temp_path) {
+            eprintln!("kds: raw stderr replay failed: {err:#}");
+        }
+        if stdout_capture.discarded_bytes > 0 || stderr_capture.discarded_bytes > 0 {
+            eprintln!(
+                "kds: raw output replay was truncated by KDS_MAX_RAW_BYTES; see raw log note"
+            );
+        }
     }
 
-    let raw_stdout_lines = storage::line_count(&stdout);
-    let raw_stderr_lines = storage::line_count(&stderr);
+    let extracted_output =
+        summarize::extract_from_paths(&stdout_temp_path, &stderr_temp_path, exit_code)?;
+    let raw_stdout_lines = extracted_output.stdout_lines;
+    let raw_stderr_lines = extracted_output.stderr_lines;
     let raw_total_lines = raw_stdout_lines + raw_stderr_lines;
-    let extracted = summarize::extract(&stdout, &stderr, exit_code);
+    let extracted = extracted_output.summary;
     let cwd_string = cwd.display().to_string();
     let digest = digest::make_digest(
         &command_kind,
-        &safe_command,
+        &safe_command_identity,
         &cwd_string,
         exit_code,
         &extracted,
@@ -95,13 +142,16 @@ pub fn run(argv: Vec<String>, mode: Mode) -> Result<i32> {
     );
 
     let log_hint = "full stdout/stderr sections preserved below";
-    if let Err(err) = storage::write_raw_log(storage::RawLog {
+    if let Err(err) = storage::write_raw_log_from_paths(storage::RawLogPaths {
         path: &run_paths.log_path,
         sidecar_hint: log_hint,
-        command: &command,
+        command: &safe_command,
         cwd: &cwd,
-        stdout: &output.stdout,
-        stderr: &output.stderr,
+        stdout_path: &stdout_temp_path,
+        stderr_path: &stderr_temp_path,
+        stdout_discarded_bytes: stdout_capture.discarded_bytes,
+        stderr_discarded_bytes: stderr_capture.discarded_bytes,
+        raw_byte_limit,
         exit_code,
         elapsed: &elapsed,
     }) {
@@ -111,7 +161,7 @@ pub fn run(argv: Vec<String>, mode: Mode) -> Result<i32> {
     let repeat_status = match digest::update_repeat_state(
         &paths,
         &digest,
-        &safe_command,
+        &safe_command_identity,
         &cwd_string,
         exit_code,
         &run_paths.log_path,
@@ -165,12 +215,12 @@ pub fn run(argv: Vec<String>, mode: Mode) -> Result<i32> {
         command_kind: command_kind.clone(),
     };
 
-    let display_once = summarize::format_compact(&sidecar);
+    let display_once = summarize::format_compact_with_paths(&sidecar, show_paths);
     sidecar.shown_lines = storage::line_count(&display_once);
     sidecar.estimated_saved_lines = raw_total_lines.saturating_sub(sidecar.shown_lines);
     sidecar.estimated_output_reduction_percent =
         storage::display_percent(sidecar.estimated_saved_lines, raw_total_lines);
-    let display = summarize::format_compact(&sidecar);
+    let display = summarize::format_compact_with_paths(&sidecar, show_paths);
 
     if mode == Mode::Compact {
         print!("{display}");
@@ -229,5 +279,96 @@ fn format_elapsed(ms: u128) -> String {
         format!("{ms}ms")
     } else {
         format!("{:.2}s", ms as f64 / 1000.0)
+    }
+}
+
+#[derive(Default)]
+struct PipeCapture {
+    captured_bytes: u64,
+    discarded_bytes: u64,
+}
+
+fn spawn_pipe_copy<R>(
+    mut reader: R,
+    mut file: fs::File,
+    raw_byte_limit: Option<u64>,
+) -> thread::JoinHandle<io::Result<PipeCapture>>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut capture = PipeCapture::default();
+        let mut buffer = [0_u8; 8192];
+        loop {
+            let read = reader.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            let writable = match raw_byte_limit {
+                Some(limit) => limit
+                    .saturating_sub(capture.captured_bytes)
+                    .min(read as u64),
+                None => read as u64,
+            } as usize;
+            if writable > 0 {
+                file.write_all(&buffer[..writable])?;
+                capture.captured_bytes += writable as u64;
+            }
+            if writable < read {
+                capture.discarded_bytes += (read - writable) as u64;
+            }
+        }
+        file.sync_all()?;
+        Ok(capture)
+    })
+}
+
+fn join_pipe_copy(
+    name: &str,
+    handle: thread::JoinHandle<io::Result<PipeCapture>>,
+) -> Result<PipeCapture> {
+    match handle.join() {
+        Ok(result) => Ok(result?),
+        Err(_) => anyhow::bail!("{name} capture thread panicked"),
+    }
+}
+
+fn copy_file_to_stdout(path: &std::path::Path) -> Result<()> {
+    let mut file = fs::File::open(path)?;
+    let mut stdout = io::stdout().lock();
+    io::copy(&mut file, &mut stdout)?;
+    stdout.flush()?;
+    Ok(())
+}
+
+fn copy_file_to_stderr(path: &std::path::Path) -> Result<()> {
+    let mut file = fs::File::open(path)?;
+    let mut stderr = io::stderr().lock();
+    io::copy(&mut file, &mut stderr)?;
+    stderr.flush()?;
+    Ok(())
+}
+
+fn raw_byte_limit() -> Option<u64> {
+    let Ok(raw) = std::env::var("KDS_MAX_RAW_BYTES") else {
+        return None;
+    };
+    match raw.parse::<u64>() {
+        Ok(0) => None,
+        Ok(limit) => Some(limit),
+        Err(_) => {
+            eprintln!("kds: ignoring invalid KDS_MAX_RAW_BYTES={raw:?}");
+            None
+        }
+    }
+}
+
+struct TempFileCleanup(Vec<std::path::PathBuf>);
+
+impl Drop for TempFileCleanup {
+    fn drop(&mut self) {
+        for path in &self.0 {
+            let _ = fs::remove_file(path);
+        }
     }
 }

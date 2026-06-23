@@ -8,6 +8,8 @@
 
 The installer builds KDS locally, copies `kds.exe` into
 `%LOCALAPPDATA%\CodexKD\bin`, and installs the automatic PowerShell hook.
+If an existing PowerShell profile is rewritten, KDS writes a timestamped
+`.kds-backup-*` copy next to the profile first.
 
 The installer prints every path it writes. It does not silently edit PATH. If
 the install directory is not already on PATH, it prints the command/user action
@@ -17,6 +19,12 @@ Dry-run:
 
 ```powershell
 .\scripts\install.ps1 --dry-run
+```
+
+Binary-only local install without editing the PowerShell profile:
+
+```powershell
+.\scripts\install.ps1 --no-hook
 ```
 
 ## Linux/macOS

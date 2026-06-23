@@ -13,7 +13,8 @@ scope, and it does not depend on RTK.
 - Routes allowlisted noisy commands through an automatic shell hook after
   install.
 - Saves full raw stdout/stderr logs locally.
-- Prints compact evidence summaries for model-visible output.
+- Prints compact evidence summaries for model-visible output without absolute
+  log/CWD paths by default.
 - Stores `.summary.json` sidecars and `state/runs.jsonl` for fast drilldown.
 - Detects repeated failure signals and tiny deltas between exact-match runs.
 - Provides safe drilldown commands and compact evidence packs.
@@ -45,6 +46,7 @@ kds raw -- node --version
 kds gain
 kds logs dir
 kds logs last
+kds logs show <run-id> --show-paths
 kds logs show <run-id> --errors
 kds evidence last
 kds hook status
@@ -59,6 +61,16 @@ share raw logs without reviewing and redacting them.
 
 `kds gain`, `kds doctor`, `kds logs last`, default `kds logs show <id>`, and
 `kds evidence last` do not print raw stdout/stderr bodies.
+
+Default compact, logs, and evidence output prints the run ID plus local drilldown
+commands instead of absolute log paths. Use `--show-paths` on `kds run`,
+`kds logs last`, `kds logs show <id>`, or `kds evidence <id>` when you
+explicitly want local paths in interactive output.
+
+Set `KDS_MAX_RAW_BYTES` to a positive byte count to cap persisted raw stdout
+and stderr per stream. KDS continues draining the child process after the cap so
+the wrapped command does not block on a full pipe. Unset it or set it to `0` for
+unlimited raw-log capture.
 
 KDS redacts common token, API key, password, bearer-token, and URL credential
 patterns from summaries, evidence, sidecars, and indexes. This is a safety
@@ -78,5 +90,6 @@ long-running daemons, commands likely to print secrets, exact `rg` or
   reduction.
 - Raw mode prints captured stdout then captured stderr; exact stream
   interleaving is not preserved in V1.
-- Wrapped command output is buffered until the command exits; V1 does not stream
-  live progress.
+- Wrapped command stdout/stderr is drained to local temp files while the command
+  runs, then summarized from bounded line state. V1 still does not stream live
+  progress to compact mode.

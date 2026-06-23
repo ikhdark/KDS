@@ -32,8 +32,10 @@ enum Command {
 
 #[derive(Debug, Args)]
 pub struct WrappedCommand {
+    #[arg(long)]
+    pub show_paths: bool,
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-    command: Vec<String>,
+    pub command: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -47,14 +49,22 @@ pub enum LogsCommand {
     /// Print the KDS log directory.
     Dir,
     /// Print safe metadata for the most recent run.
-    Last,
+    Last(LogsDisplayArgs),
     /// Show safe metadata or one requested section for a run.
     Show(LogsShowArgs),
 }
 
 #[derive(Debug, Args)]
+pub struct LogsDisplayArgs {
+    #[arg(long)]
+    pub show_paths: bool,
+}
+
+#[derive(Debug, Args)]
 pub struct LogsShowArgs {
     pub id: String,
+    #[arg(long)]
+    pub show_paths: bool,
     #[arg(long)]
     pub summary: bool,
     #[arg(long)]
@@ -68,6 +78,8 @@ pub struct LogsShowArgs {
 #[derive(Debug, Args)]
 pub struct EvidenceArgs {
     pub id: String,
+    #[arg(long)]
+    pub show_paths: bool,
 }
 
 #[derive(Debug, Args)]
@@ -118,17 +130,22 @@ pub fn run() -> Result<i32> {
         return crate::runner::run(
             raw_args.into_iter().skip(1).collect(),
             crate::runner::Mode::Compact,
+            false,
         );
     }
 
     let cli = Cli::parse();
     match cli.command {
-        Some(Command::Run(args)) => crate::runner::run(args.command, crate::runner::Mode::Compact),
-        Some(Command::Raw(args)) => crate::runner::run(args.command, crate::runner::Mode::Raw),
+        Some(Command::Run(args)) => {
+            crate::runner::run(args.command, crate::runner::Mode::Compact, args.show_paths)
+        }
+        Some(Command::Raw(args)) => {
+            crate::runner::run(args.command, crate::runner::Mode::Raw, args.show_paths)
+        }
         Some(Command::Gain) => crate::gain::run(),
         Some(Command::Doctor) => crate::doctor::run(),
         Some(Command::Logs(args)) => crate::logs::run(args.command),
-        Some(Command::Evidence(args)) => crate::evidence::run(args.id),
+        Some(Command::Evidence(args)) => crate::evidence::run(args.id, args.show_paths),
         Some(Command::Init(args)) => crate::init_codex::run(args),
         Some(Command::Hook(args)) => crate::hook::run(args.command),
         None => bail!("no command provided; use `kds -- <command...>` or `kds --help`"),

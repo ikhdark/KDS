@@ -1,6 +1,8 @@
 # Hooks
 
 KDS V1 installs an automatic PowerShell hook by default on Windows.
+When installing or repairing the hook, KDS backs up an existing PowerShell
+profile before writing the managed block.
 
 The hook is allowlisted and conservative. If it is uncertain, it runs the
 original command unchanged.

@@ -62,8 +62,19 @@ pub fn install_powershell_hook() -> Result<i32> {
     let current = fs::read_to_string(&profile).unwrap_or_default();
     let block = hook_block()?;
     let updated = upsert_block(&current, &block);
+    if updated == current {
+        println!("KDS PowerShell hook is already installed:");
+        println!("{}", profile.display());
+        return Ok(0);
+    }
     if let Some(parent) = profile.parent() {
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    if profile.exists() {
+        let backup = profile_backup_path(&profile);
+        storage::write_text_atomic(&backup, &current)?;
+        println!("Backed up PowerShell profile:");
+        println!("{}", backup.display());
     }
     storage::write_text_atomic(&profile, &updated)?;
     println!("Installed automatic KDS PowerShell hook:");
@@ -105,6 +116,15 @@ fn powershell_profile_path() -> PathBuf {
         .join("Documents")
         .join("PowerShell")
         .join("Microsoft.PowerShell_profile.ps1")
+}
+
+fn profile_backup_path(profile: &std::path::Path) -> PathBuf {
+    let stamp = storage::iso_now().replace([':', '+'], "").replace('.', "-");
+    let file_name = profile
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("Microsoft.PowerShell_profile.ps1");
+    profile.with_file_name(format!("{file_name}.kds-backup-{stamp}"))
 }
 
 fn hook_block() -> Result<String> {

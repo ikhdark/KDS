@@ -4,12 +4,14 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $DryRun = $false
+$NoHook = $false
 $Help = $false
 
 foreach ($arg in $args) {
   switch ($arg) {
     "--dry-run" { $DryRun = $true }
     "-DryRun" { $DryRun = $true }
+    "--no-hook" { $NoHook = $true }
     "--help" { $Help = $true }
     "-h" { $Help = $true }
     "-Help" { $Help = $true }
@@ -25,12 +27,12 @@ if ($Help) {
 KDS Windows installer
 
 Usage:
-  ./scripts/install.ps1 [--dry-run] [--help]
+  ./scripts/install.ps1 [--dry-run] [--no-hook] [--help]
 
 Behavior:
   - builds KDS from this repository
   - installs kds.exe to %LOCALAPPDATA%\CodexKD\bin
-  - installs the automatic PowerShell hook by default
+  - installs the automatic PowerShell hook by default unless --no-hook is set
   - does not silently edit PATH
   - does not modify Codex config
 "@ | Write-Host
@@ -46,7 +48,11 @@ Write-Host "KDS install plan"
 Write-Host "Repository: $repo"
 Write-Host "Install directory: $installDir"
 Write-Host "Binary: $targetExe"
-Write-Host "Automatic hook: PowerShell profile managed by kds hook install powershell"
+if ($NoHook) {
+  Write-Host "Automatic hook: skipped by --no-hook"
+} else {
+  Write-Host "Automatic hook: PowerShell profile managed by kds hook install powershell"
+}
 
 if ($DryRun) {
   Write-Host "Dry run: no binary copy, no hook/profile edit, no Codex config edit, no PATH edit."
@@ -64,7 +70,13 @@ New-Item -ItemType Directory -Force -Path $installDir | Out-Null
 Copy-Item -Force -Path $builtExe -Destination $targetExe
 Write-Host "Wrote: $targetExe"
 
-& $targetExe hook install powershell
+if ($NoHook) {
+  Write-Host "Skipped automatic PowerShell hook install."
+  Write-Host "Install it later with:"
+  Write-Host "  kds hook install powershell"
+} else {
+  & $targetExe hook install powershell
+}
 
 $pathEntries = [Environment]::GetEnvironmentVariable("Path", "User") -split ';'
 if ($pathEntries -notcontains $installDir) {

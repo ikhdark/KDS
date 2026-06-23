@@ -1,4 +1,8 @@
 use regex::Regex;
+use std::collections::VecDeque;
+use std::fs;
+use std::io::{BufRead, BufReader};
+use std::path::Path;
 use std::sync::OnceLock;
 
 use crate::storage::SummarySidecar;
@@ -14,69 +18,123 @@ pub struct ExtractedSummary {
     pub suggested_next_reads: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ExtractedOutput {
+    pub summary: ExtractedSummary,
+    pub stdout_lines: usize,
+    pub stderr_lines: usize,
+}
+
+#[cfg(test)]
 pub fn extract(stdout: &str, stderr: &str, exit_code: i32) -> ExtractedSummary {
-    let raw_combined = if stderr.is_empty() {
-        stdout.to_string()
-    } else if stdout.is_empty() {
-        stderr.to_string()
-    } else {
-        format!("{stdout}\n{stderr}")
-    };
-    let combined = redact_sensitive_text(&strip_ansi(&raw_combined));
-    let lines: Vec<String> = combined
-        .lines()
-        .map(|line| line.trim_end().to_string())
-        .collect();
-    let nonblank: Vec<String> = lines
-        .iter()
-        .filter(|line| !line.trim().is_empty())
-        .cloned()
-        .collect();
-
-    let warning_count = lines
-        .iter()
-        .filter(|line| {
-            let lower = line.to_ascii_lowercase();
-            lower.contains("warning:")
-                || lower.starts_with("warn ")
-                || lower.starts_with("npm warn ")
-                || lower.contains(" npm warn ")
-        })
-        .count();
-
-    let error_count = lines.iter().filter(|line| is_error_line(line)).count();
-
-    let mut top_errors = Vec::new();
-    for line in nonblank.iter().filter(|line| is_error_line(line)) {
-        push_unique_cap(&mut top_errors, line.clone(), 8);
+    let mut builder = SummaryBuilder::default();
+    for line in stdout.lines() {
+        builder.push_line(line);
     }
-    if top_errors.is_empty() && exit_code != 0 {
-        for line in nonblank.iter().rev().take(8).rev() {
-            push_unique_cap(&mut top_errors, line.clone(), 8);
+    for line in stderr.lines() {
+        builder.push_line(line);
+    }
+    builder.finish(exit_code)
+}
+
+pub fn extract_from_paths(
+    stdout_path: &Path,
+    stderr_path: &Path,
+    exit_code: i32,
+) -> std::io::Result<ExtractedOutput> {
+    let mut builder = SummaryBuilder::default();
+    let stdout_lines = scan_path(stdout_path, &mut builder)?;
+    let stderr_lines = scan_path(stderr_path, &mut builder)?;
+    Ok(ExtractedOutput {
+        summary: builder.finish(exit_code),
+        stdout_lines,
+        stderr_lines,
+    })
+}
+
+fn scan_path(path: &Path, builder: &mut SummaryBuilder) -> std::io::Result<usize> {
+    let file = fs::File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    let mut lines = 0;
+    loop {
+        line.clear();
+        let bytes = reader.read_until(b'\n', &mut line)?;
+        if bytes == 0 {
+            break;
+        }
+        lines += 1;
+        let line = String::from_utf8_lossy(&line);
+        builder.push_line(line.trim_end_matches(['\r', '\n']));
+    }
+    Ok(lines)
+}
+
+#[derive(Default)]
+struct SummaryBuilder {
+    warning_count: usize,
+    error_count: usize,
+    top_errors: Vec<String>,
+    file_hits: Vec<String>,
+    tail: VecDeque<String>,
+}
+
+impl SummaryBuilder {
+    fn push_line(&mut self, raw_line: &str) {
+        let line = redact_sensitive_text(&strip_ansi(raw_line))
+            .trim_end()
+            .to_string();
+        let lower = line.to_ascii_lowercase();
+        if lower.contains("warning:")
+            || lower.starts_with("warn ")
+            || lower.starts_with("npm warn ")
+            || lower.contains(" npm warn ")
+        {
+            self.warning_count += 1;
+        }
+        if is_error_line(&line) {
+            self.error_count += 1;
+        }
+        if !line.trim().is_empty() {
+            if is_error_line(&line) {
+                push_unique_cap(&mut self.top_errors, line.clone(), 8);
+            }
+            for hit in extract_file_hits(&line, 10) {
+                push_unique_cap(&mut self.file_hits, hit, 10);
+            }
+            self.tail.push_back(line);
+            if self.tail.len() > 40 {
+                self.tail.pop_front();
+            }
         }
     }
 
-    let file_hits = extract_file_hits(&combined, 10);
-    let suggested_next_reads = file_hits.iter().take(5).cloned().collect();
-    let tail = nonblank
-        .iter()
-        .rev()
-        .take(40)
-        .cloned()
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    let primary_failure = top_errors.first().cloned();
-
-    ExtractedSummary {
-        error_count,
-        warning_count,
-        primary_failure,
-        top_errors,
-        file_hits,
-        tail,
-        suggested_next_reads,
+    fn finish(mut self, exit_code: i32) -> ExtractedSummary {
+        if self.top_errors.is_empty() && exit_code != 0 {
+            for line in self
+                .tail
+                .iter()
+                .rev()
+                .take(8)
+                .cloned()
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+            {
+                push_unique_cap(&mut self.top_errors, line, 8);
+            }
+        }
+        let suggested_next_reads = self.file_hits.iter().take(5).cloned().collect();
+        let primary_failure = self.top_errors.first().cloned();
+        ExtractedSummary {
+            error_count: self.error_count,
+            warning_count: self.warning_count,
+            primary_failure,
+            top_errors: self.top_errors,
+            file_hits: self.file_hits,
+            tail: self.tail.into_iter().collect(),
+            suggested_next_reads,
+        }
     }
 }
 
@@ -203,13 +261,13 @@ fn known_secret_re() -> &'static Regex {
     })
 }
 
-pub fn format_compact(sidecar: &SummarySidecar) -> String {
+pub fn format_compact_with_paths(sidecar: &SummarySidecar, show_paths: bool) -> String {
     if sidecar.exit_code == 0 && sidecar.warning_count == 0 {
         return format!(
-            "KDS\nRun ID: {}\nExit code: 0\nElapsed: {}\nLog: {}\nEstimated output reduction: {} lines ({:.1}%)\nSummary: success\nWarnings: 0\n",
+            "KDS\nRun ID: {}\nExit code: 0\nElapsed: {}\n{}\nEstimated output reduction: {} lines ({:.1}%)\nSummary: success\nWarnings: 0\n",
             sidecar.run_id,
             sidecar.elapsed,
-            sidecar.log_path,
+            log_line(sidecar, show_paths),
             sidecar.estimated_saved_lines,
             sidecar.estimated_output_reduction_percent
         );
@@ -218,11 +276,16 @@ pub fn format_compact(sidecar: &SummarySidecar) -> String {
     let mut out = String::new();
     out.push_str("KDS\n");
     out.push_str(&format!("Run ID: {}\n", sidecar.run_id));
-    out.push_str(&format!("Command: {}\n", sidecar.command));
-    out.push_str(&format!("CWD: {}\n", sidecar.cwd));
+    out.push_str(&format!(
+        "Command: {}\n",
+        display_text(&sidecar.command, sidecar, show_paths)
+    ));
+    if show_paths {
+        out.push_str(&format!("CWD: {}\n", sidecar.cwd));
+    }
     out.push_str(&format!("Exit code: {}\n", sidecar.exit_code));
     out.push_str(&format!("Elapsed: {}\n", sidecar.elapsed));
-    out.push_str(&format!("Log: {}\n", sidecar.log_path));
+    out.push_str(&format!("{}\n", log_line(sidecar, show_paths)));
     out.push_str(&format!("Digest: {}\n", sidecar.digest));
     out.push_str(&format!("Repeat: {}\n", sidecar.repeat_status.message));
     out.push_str(&format!(
@@ -238,35 +301,54 @@ pub fn format_compact(sidecar: &SummarySidecar) -> String {
         out.push_str(&format!("Changed since previous run: {delta}\n"));
     }
     out.push_str("Top errors:\n");
-    write_list(&mut out, &sidecar.top_errors, 3);
+    write_list(
+        &mut out,
+        &display_list(&sidecar.top_errors, sidecar, show_paths),
+        3,
+    );
     out.push_str("File hits:\n");
-    write_list(&mut out, &sidecar.file_hits, 10);
+    write_list(
+        &mut out,
+        &display_list(&sidecar.file_hits, sidecar, show_paths),
+        10,
+    );
     out.push_str(&format!("Warnings: {}\n", sidecar.warning_count));
     out.push_str("Final tail:\n");
-    write_list(&mut out, &sidecar.tail, 40);
+    write_list(
+        &mut out,
+        &display_list(&sidecar.tail, sidecar, show_paths),
+        40,
+    );
     out.push_str("Suggested next read:\n");
-    write_list(&mut out, &sidecar.suggested_next_reads, 5);
+    write_list(
+        &mut out,
+        &display_list(&sidecar.suggested_next_reads, sidecar, show_paths),
+        5,
+    );
     out
 }
 
-pub fn format_safe_metadata(sidecar: &SummarySidecar) -> String {
+pub fn format_safe_metadata_with_paths(sidecar: &SummarySidecar, show_paths: bool) -> String {
     format!(
-        "KDS run\nRun ID: {}\nCommand: {}\nExit code: {}\nElapsed: {}\nLog: {}\nDigest: {}\nRepeat: {}\nAvailable:\n  --summary\n  --errors\n  --tail\n  --file-hits\nWarning: raw logs may contain secrets, paths, tokens, stack traces, environment values, or file contents.\n",
+        "KDS run\nRun ID: {}\nCommand: {}\nExit code: {}\nElapsed: {}\n{}\nDigest: {}\nRepeat: {}\nAvailable:\n  --summary\n  --errors\n  --tail\n  --file-hits\nWarning: raw logs may contain secrets, paths, tokens, stack traces, environment values, or file contents.\n",
         sidecar.run_id,
-        sidecar.command,
+        display_text(&sidecar.command, sidecar, show_paths),
         sidecar.exit_code,
         sidecar.elapsed,
-        sidecar.log_path,
+        log_line(sidecar, show_paths),
         sidecar.digest,
         sidecar.repeat_status.message
     )
 }
 
-pub fn format_evidence(sidecar: &SummarySidecar) -> String {
+pub fn format_evidence_with_paths(sidecar: &SummarySidecar, show_paths: bool) -> String {
     let mut out = String::new();
     out.push_str("KDS evidence\n");
     out.push_str(&format!("Run ID: {}\n", sidecar.run_id));
-    out.push_str(&format!("Command: {}\n", sidecar.command));
+    out.push_str(&format!(
+        "Command: {}\n",
+        display_text(&sidecar.command, sidecar, show_paths)
+    ));
     out.push_str(&format!("Exit code: {}\n", sidecar.exit_code));
     out.push_str(&format!("Digest: {}\n", sidecar.digest));
     out.push_str(&format!("Repeat: {}\n", sidecar.repeat_status.message));
@@ -274,17 +356,37 @@ pub fn format_evidence(sidecar: &SummarySidecar) -> String {
         out.push_str(&format!("Changed since previous run: {delta}\n"));
     }
     out.push_str("Top errors:\n");
-    write_list(&mut out, &sidecar.top_errors, 3);
+    write_list(
+        &mut out,
+        &display_list(&sidecar.top_errors, sidecar, show_paths),
+        3,
+    );
     out.push_str("File hits:\n");
-    write_list(&mut out, &sidecar.file_hits, 5);
+    write_list(
+        &mut out,
+        &display_list(&sidecar.file_hits, sidecar, show_paths),
+        5,
+    );
     out.push_str("Suggested next reads:\n");
-    write_list(&mut out, &sidecar.suggested_next_reads, 5);
-    out.push_str(&format!("Log: {}\n", sidecar.log_path));
+    write_list(
+        &mut out,
+        &display_list(&sidecar.suggested_next_reads, sidecar, show_paths),
+        5,
+    );
+    out.push_str(&format!("{}\n", log_line(sidecar, show_paths)));
     out.push_str(&format!(
         "Estimated output reduction: {} lines ({:.1}%)\n",
         sidecar.estimated_saved_lines, sidecar.estimated_output_reduction_percent
     ));
     out
+}
+
+pub fn display_items_for_paths(
+    sidecar: &SummarySidecar,
+    items: &[String],
+    show_paths: bool,
+) -> Vec<String> {
+    display_list(items, sidecar, show_paths)
 }
 
 pub fn delta_line(
@@ -331,12 +433,8 @@ fn is_error_line(line: &str) -> bool {
 }
 
 fn extract_file_hits(text: &str, cap: usize) -> Vec<String> {
-    let re = Regex::new(
-        r"(?m)([A-Za-z]:\\[^:\r\n]+|(?:\.{0,2}[\\/])?[\w .\-/\\]+\.[A-Za-z0-9_]+):(\d+)(?::(\d+))?",
-    )
-    .unwrap();
     let mut hits = Vec::new();
-    for caps in re.captures_iter(text) {
+    for caps in file_hit_re().captures_iter(text) {
         let mut hit = format!("{}:{}", &caps[1], &caps[2]);
         if let Some(col) = caps.get(3) {
             hit.push(':');
@@ -348,6 +446,69 @@ fn extract_file_hits(text: &str, cap: usize) -> Vec<String> {
         }
     }
     hits
+}
+
+fn file_hit_re() -> &'static Regex {
+    static FILE_HIT_RE: OnceLock<Regex> = OnceLock::new();
+    FILE_HIT_RE.get_or_init(|| {
+        Regex::new(
+            r"(?m)([A-Za-z]:\\[^:\r\n]+|(?:\.{0,2}[\\/])?[\w .\-/\\]+\.[A-Za-z0-9_]+):(\d+)(?::(\d+))?",
+        )
+        .unwrap()
+    })
+}
+
+fn log_line(sidecar: &SummarySidecar, show_paths: bool) -> String {
+    if show_paths {
+        format!("Log: {}", sidecar.log_path)
+    } else {
+        format!(
+            "Log: use `kds logs show {} --show-paths` or `kds logs dir`",
+            sidecar.run_id
+        )
+    }
+}
+
+fn display_list(items: &[String], sidecar: &SummarySidecar, show_paths: bool) -> Vec<String> {
+    items
+        .iter()
+        .map(|item| display_text(item, sidecar, show_paths))
+        .collect()
+}
+
+fn display_text(text: &str, sidecar: &SummarySidecar, show_paths: bool) -> String {
+    if show_paths {
+        return text.to_string();
+    }
+    let mut out = text.to_string();
+    out = replace_path_prefix(&out, &sidecar.cwd, "<cwd>");
+    if let Some(home) = home_dir_string() {
+        out = replace_path_prefix(&out, &home, "~");
+    }
+    out
+}
+
+fn replace_path_prefix(text: &str, prefix: &str, replacement: &str) -> String {
+    if prefix.is_empty() {
+        return text.to_string();
+    }
+    let mut out = text.replace(prefix, replacement);
+    let slash_prefix = prefix.replace('\\', "/");
+    if slash_prefix != prefix {
+        out = out.replace(&slash_prefix, replacement);
+    }
+    let backslash_prefix = prefix.replace('/', "\\");
+    if backslash_prefix != prefix {
+        out = out.replace(&backslash_prefix, replacement);
+    }
+    out
+}
+
+fn home_dir_string() -> Option<String> {
+    std::env::var("USERPROFILE")
+        .ok()
+        .filter(|path| !path.is_empty())
+        .or_else(|| std::env::var("HOME").ok().filter(|path| !path.is_empty()))
 }
 
 fn push_unique_cap(items: &mut Vec<String>, item: String, cap: usize) {
@@ -371,6 +532,50 @@ fn write_list(out: &mut String, items: &[String], cap: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::RepeatStatus;
+
+    fn sidecar_for_display() -> SummarySidecar {
+        SummarySidecar {
+            summary_schema_version: 1,
+            kds_version: "0.1.0".into(),
+            run_id: "run-123".into(),
+            summary_path: "C:\\Users\\tester\\repo\\.kds\\run.summary.json".into(),
+            command: "cargo test".into(),
+            argv: vec!["cargo".into(), "test".into()],
+            cwd: "C:\\Users\\tester\\repo".into(),
+            mode: "compact".into(),
+            exit_code: 1,
+            elapsed: "10ms".into(),
+            elapsed_ms: 10,
+            digest: "digest".into(),
+            repeat_status: RepeatStatus {
+                is_repeat: false,
+                message: "new failure signal".into(),
+                first_seen: None,
+                previous_log_path: None,
+                current_log_path: "C:\\Users\\tester\\kds\\run.log".into(),
+                repeat_count: 0,
+            },
+            raw_stdout_lines: 10,
+            raw_stderr_lines: 5,
+            raw_total_lines: 15,
+            shown_lines: 0,
+            estimated_saved_lines: 5,
+            estimated_output_reduction_percent: 33.3,
+            error_count: 1,
+            warning_count: 0,
+            primary_failure: Some("error: C:\\Users\\tester\\repo\\src\\main.rs:1".into()),
+            delta: None,
+            top_errors: vec!["error: C:\\Users\\tester\\repo\\src\\main.rs:1".into()],
+            file_hits: vec!["C:\\Users\\tester\\repo\\src\\main.rs:1".into()],
+            tail: vec!["failed at C:\\Users\\tester\\repo\\src\\main.rs:1".into()],
+            suggested_next_reads: vec!["C:\\Users\\tester\\repo\\src\\main.rs:1".into()],
+            log_path: "C:\\Users\\tester\\kds\\run.log".into(),
+            previous_exact_match_run: None,
+            started_at: "2026-01-01T00:00:00Z".into(),
+            command_kind: "cargo".into(),
+        }
+    }
 
     #[test]
     fn extracts_rust_error_and_file_hit() {
@@ -445,5 +650,31 @@ jwt=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.sflKxwRJSMeKKF2QT4fwpMeJf36
         assert!(!line.contains("SECRET_CANARY_PATH_LEAK"));
         assert!(!line.contains("abc123"));
         assert_eq!(line, "deploy --token [redacted] --api-key=[redacted]");
+    }
+
+    #[test]
+    fn compact_output_hides_paths_until_show_paths_is_enabled() {
+        let sidecar = sidecar_for_display();
+        let hidden = format_compact_with_paths(&sidecar, false);
+        assert!(!hidden.contains("CWD:"), "hidden:\n{hidden}");
+        assert!(
+            !hidden.contains("C:\\Users\\tester\\kds\\run.log"),
+            "hidden:\n{hidden}"
+        );
+        assert!(hidden.contains("Log: use `kds logs show run-123 --show-paths`"));
+        assert!(
+            hidden.contains("<cwd>\\src\\main.rs:1"),
+            "hidden:\n{hidden}"
+        );
+
+        let shown = format_compact_with_paths(&sidecar, true);
+        assert!(
+            shown.contains("CWD: C:\\Users\\tester\\repo"),
+            "shown:\n{shown}"
+        );
+        assert!(
+            shown.contains("Log: C:\\Users\\tester\\kds\\run.log"),
+            "shown:\n{shown}"
+        );
     }
 }

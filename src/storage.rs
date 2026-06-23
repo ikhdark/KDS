@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, ErrorKind, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -133,10 +133,9 @@ impl Paths {
     }
 
     pub fn ensure_runtime_dirs(&self) -> Result<()> {
-        fs::create_dir_all(&self.logs_dir)
-            .with_context(|| format!("create {}", self.logs_dir.display()))?;
-        fs::create_dir_all(&self.state_dir)
-            .with_context(|| format!("create {}", self.state_dir.display()))?;
+        create_private_dir_all(&self.root)?;
+        create_private_dir_all(&self.logs_dir)?;
+        create_private_dir_all(&self.state_dir)?;
         Ok(())
     }
 
@@ -149,7 +148,7 @@ impl Paths {
         self.ensure_runtime_dirs()?;
         let date = started.format("%Y-%m-%d").to_string();
         let date_dir = self.logs_dir.join(date);
-        fs::create_dir_all(&date_dir).with_context(|| format!("create {}", date_dir.display()))?;
+        create_private_dir_all(&date_dir)?;
         let run_id = make_run_id(argv, cwd, started);
         let log_path = date_dir.join(format!("{run_id}.log"));
         let summary_path = date_dir.join(format!("{run_id}.summary.json"));
@@ -162,7 +161,49 @@ impl Paths {
 }
 
 pub fn command_string(argv: &[String]) -> String {
-    argv.join(" ")
+    argv.iter()
+        .map(|arg| render_command_arg(arg))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+pub fn command_identity(argv: &[String]) -> String {
+    serde_json::to_string(argv).unwrap_or_else(|_| command_string(argv))
+}
+
+fn render_command_arg(arg: &str) -> String {
+    if !needs_command_quote(arg) {
+        return arg.to_string();
+    }
+    if cfg!(windows) {
+        format!("'{}'", arg.replace('\'', "''"))
+    } else {
+        format!("'{}'", arg.replace('\'', "'\\''"))
+    }
+}
+
+fn needs_command_quote(arg: &str) -> bool {
+    arg.is_empty()
+        || arg.chars().any(|ch| {
+            ch.is_whitespace()
+                || matches!(
+                    ch,
+                    '\'' | '"'
+                        | '`'
+                        | '$'
+                        | '&'
+                        | '|'
+                        | ';'
+                        | '<'
+                        | '>'
+                        | '('
+                        | ')'
+                        | '{'
+                        | '}'
+                        | '['
+                        | ']'
+                )
+        })
 }
 
 pub fn command_kind(argv: &[String]) -> String {
@@ -252,6 +293,7 @@ fn is_path_like(command: &str) -> bool {
     command.contains('/') || command.contains('\\') || Path::new(command).is_absolute()
 }
 
+#[cfg(test)]
 pub struct RawLog<'a> {
     pub path: &'a Path,
     pub sidecar_hint: &'a str,
@@ -263,17 +305,31 @@ pub struct RawLog<'a> {
     pub elapsed: &'a str,
 }
 
+pub struct RawLogPaths<'a> {
+    pub path: &'a Path,
+    pub sidecar_hint: &'a str,
+    pub command: &'a str,
+    pub cwd: &'a Path,
+    pub stdout_path: &'a Path,
+    pub stderr_path: &'a Path,
+    pub stdout_discarded_bytes: u64,
+    pub stderr_discarded_bytes: u64,
+    pub raw_byte_limit: Option<u64>,
+    pub exit_code: i32,
+    pub elapsed: &'a str,
+}
+
+#[cfg(test)]
 pub fn write_raw_log(record: RawLog<'_>) -> Result<()> {
-    let mut file = fs::File::create(record.path)
+    let mut file = create_private_file_new(record.path)
         .with_context(|| format!("write raw log {}", record.path.display()))?;
-    write!(
-        file,
-        "KDS raw command log\nCommand: {}\nCWD: {}\nExit code: {}\nElapsed: {}\nSummary: {}\n\n--- stdout ---\n",
+    write_raw_log_header(
+        &mut file,
         record.command,
-        record.cwd.display(),
+        record.cwd,
         record.exit_code,
         record.elapsed,
-        record.sidecar_hint
+        record.sidecar_hint,
     )?;
     file.write_all(record.stdout)?;
     if !record.stdout.ends_with(b"\n") {
@@ -287,6 +343,94 @@ pub fn write_raw_log(record: RawLog<'_>) -> Result<()> {
     Ok(())
 }
 
+pub fn write_raw_log_from_paths(record: RawLogPaths<'_>) -> Result<()> {
+    let mut file = create_private_file_new(record.path)
+        .with_context(|| format!("write raw log {}", record.path.display()))?;
+    write_raw_log_header(
+        &mut file,
+        record.command,
+        record.cwd,
+        record.exit_code,
+        record.elapsed,
+        record.sidecar_hint,
+    )?;
+    copy_file_with_trailing_newline(record.stdout_path, &mut file)?;
+    write_truncation_note(
+        &mut file,
+        "stdout",
+        record.raw_byte_limit,
+        record.stdout_discarded_bytes,
+    )?;
+    file.write_all(b"\n--- stderr ---\n")?;
+    copy_file_with_trailing_newline(record.stderr_path, &mut file)?;
+    write_truncation_note(
+        &mut file,
+        "stderr",
+        record.raw_byte_limit,
+        record.stderr_discarded_bytes,
+    )?;
+    Ok(())
+}
+
+fn write_raw_log_header(
+    file: &mut fs::File,
+    command: &str,
+    cwd: &Path,
+    exit_code: i32,
+    elapsed: &str,
+    sidecar_hint: &str,
+) -> Result<()> {
+    write!(
+        file,
+        "KDS raw command log\nCommand: {}\nCWD: {}\nExit code: {}\nElapsed: {}\nSummary: {}\n\n--- stdout ---\n",
+        command,
+        cwd.display(),
+        exit_code,
+        elapsed,
+        sidecar_hint
+    )?;
+    Ok(())
+}
+
+fn copy_file_with_trailing_newline(path: &Path, out: &mut fs::File) -> Result<()> {
+    let mut input = fs::File::open(path).with_context(|| format!("read {}", path.display()))?;
+    let mut buffer = [0_u8; 8192];
+    let mut last_byte = None;
+    loop {
+        let read = input
+            .read(&mut buffer)
+            .with_context(|| format!("read {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        last_byte = Some(buffer[read - 1]);
+        out.write_all(&buffer[..read])?;
+    }
+    if last_byte != Some(b'\n') {
+        out.write_all(b"\n")?;
+    }
+    Ok(())
+}
+
+fn write_truncation_note(
+    file: &mut fs::File,
+    stream: &str,
+    raw_byte_limit: Option<u64>,
+    discarded_bytes: u64,
+) -> Result<()> {
+    if discarded_bytes == 0 {
+        return Ok(());
+    }
+    let limit = raw_byte_limit
+        .map(|limit| limit.to_string())
+        .unwrap_or_else(|| "configured limit".to_string());
+    writeln!(
+        file,
+        "[kds: {stream} raw log capture reached {limit} bytes; discarded {discarded_bytes} additional byte(s)]"
+    )?;
+    Ok(())
+}
+
 pub fn write_sidecar(path: &Path, sidecar: &SummarySidecar) -> Result<()> {
     write_json_atomic(path, sidecar)
 }
@@ -297,13 +441,14 @@ pub fn read_sidecar(path: &Path) -> Result<SummarySidecar> {
 }
 
 pub fn append_index(paths: &Paths, entry: &IndexEntry) -> Result<()> {
+    with_state_lock(paths, || append_index_unlocked(paths, entry))
+}
+
+fn append_index_unlocked(paths: &Paths, entry: &IndexEntry) -> Result<()> {
     if let Some(parent) = paths.runs_index.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+        create_private_dir_all(parent)?;
     }
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&paths.runs_index)
+    let mut file = append_private_file(&paths.runs_index)
         .with_context(|| format!("open {}", paths.runs_index.display()))?;
     let mut line = serde_json::to_string(entry)?;
     line.push('\n');
@@ -392,14 +537,13 @@ pub fn load_metrics(paths: &Paths) -> Metrics {
 
 pub fn write_metrics(paths: &Paths, metrics: &Metrics) -> Result<()> {
     if let Some(parent) = paths.metrics.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+        create_private_dir_all(parent)?;
     }
     write_json_atomic(&paths.metrics, metrics)
 }
 
 pub fn with_state_lock<T>(paths: &Paths, action: impl FnOnce() -> Result<T>) -> Result<T> {
-    fs::create_dir_all(&paths.state_dir)
-        .with_context(|| format!("create {}", paths.state_dir.display()))?;
+    create_private_dir_all(&paths.state_dir)?;
     let _guard = StateLock::acquire(paths.state_dir.join("state.lock"))?;
     action()
 }
@@ -412,7 +556,7 @@ impl StateLock {
     fn acquire(path: PathBuf) -> Result<Self> {
         let start = Instant::now();
         loop {
-            match OpenOptions::new().write(true).create_new(true).open(&path) {
+            match create_private_file_new(&path) {
                 Ok(mut file) => {
                     writeln!(file, "pid={}", std::process::id())
                         .with_context(|| format!("write {}", path.display()))?;
@@ -452,30 +596,121 @@ fn is_stale_lock(path: &Path) -> bool {
 
 pub fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+        create_private_dir_all(parent)?;
     }
     let tmp = tmp_path(
         path,
         path.extension().and_then(|e| e.to_str()).unwrap_or("json"),
     );
     let text = serde_json::to_string_pretty(value)?;
-    fs::write(&tmp, text).with_context(|| format!("write {}", tmp.display()))?;
-    fs::rename(&tmp, path)
-        .with_context(|| format!("rename {} to {}", tmp.display(), path.display()))?;
+    write_private_atomic_bytes(path, &tmp, text.as_bytes())?;
     Ok(())
 }
 
 pub fn write_text_atomic(path: &Path, text: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+        create_private_dir_all(parent)?;
     }
     let tmp = tmp_path(
         path,
         path.extension().and_then(|e| e.to_str()).unwrap_or("txt"),
     );
-    fs::write(&tmp, text).with_context(|| format!("write {}", tmp.display()))?;
-    fs::rename(&tmp, path)
-        .with_context(|| format!("rename {} to {}", tmp.display(), path.display()))?;
+    write_private_atomic_bytes(path, &tmp, text.as_bytes())?;
+    Ok(())
+}
+
+pub fn create_temp_file_near(path: &Path, label: &str) -> Result<(PathBuf, fs::File)> {
+    let tmp = tmp_path(path, label);
+    if let Some(parent) = tmp.parent() {
+        create_private_dir_all(parent)?;
+    }
+    let file =
+        create_private_file_new(&tmp).with_context(|| format!("create {}", tmp.display()))?;
+    Ok((tmp, file))
+}
+
+fn write_private_atomic_bytes(path: &Path, tmp: &Path, bytes: &[u8]) -> Result<()> {
+    let mut file =
+        create_private_file_new(tmp).with_context(|| format!("write {}", tmp.display()))?;
+    file.write_all(bytes)
+        .with_context(|| format!("write {}", tmp.display()))?;
+    file.sync_all()
+        .with_context(|| format!("sync {}", tmp.display()))?;
+    replace_file(tmp, path)
+}
+
+fn replace_file(tmp: &Path, path: &Path) -> Result<()> {
+    match fs::rename(tmp, path) {
+        Ok(()) => Ok(()),
+        Err(_err) if cfg!(windows) && path.exists() => {
+            fs::remove_file(path).with_context(|| format!("remove {}", path.display()))?;
+            fs::rename(tmp, path)
+                .with_context(|| format!("rename {} to {}", tmp.display(), path.display()))
+        }
+        Err(err) => {
+            Err(err).with_context(|| format!("rename {} to {}", tmp.display(), path.display()))
+        }
+    }
+}
+
+fn create_private_file_new(path: &Path) -> std::io::Result<fs::File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(file)
+}
+
+fn append_private_file(path: &Path) -> Result<fs::File> {
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(file)
+}
+
+fn create_private_dir_all(path: &Path) -> Result<()> {
+    let existed = path.exists();
+    fs::create_dir_all(path).with_context(|| format!("create {}", path.display()))?;
+    harden_private_dir(path, existed)
+}
+
+#[cfg(unix)]
+fn harden_private_dir(path: &Path, existed: bool) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let metadata = fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
+    let mode = metadata.permissions().mode();
+    if existed && mode & 0o002 != 0 {
+        anyhow::bail!(
+            "refusing world-writable KDS storage directory {}",
+            path.display()
+        );
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("chmod 700 {}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn harden_private_dir(_path: &Path, _existed: bool) -> Result<()> {
     Ok(())
 }
 
@@ -495,7 +730,7 @@ fn make_run_id(argv: &[String], cwd: &Path, started: DateTime<Local>) -> String 
     let stamp = started.format("%Y-%m-%d-%H%M%S").to_string();
     let slug = make_slug(argv);
     let mut hasher = Sha256::new();
-    hasher.update(command_string(argv).as_bytes());
+    hasher.update(command_identity(argv).as_bytes());
     hasher.update(cwd.to_string_lossy().as_bytes());
     hasher.update(
         started
@@ -550,6 +785,21 @@ pub fn iso_now() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_rendering_quotes_display_and_identity_preserves_argv_boundaries() {
+        let argv = vec![
+            "tool".to_string(),
+            "two words".to_string(),
+            "plain".to_string(),
+        ];
+        let rendered = command_string(&argv);
+        assert!(rendered.contains("'two words'"), "rendered: {rendered}");
+
+        let combined = vec!["tool".to_string(), "a b".to_string()];
+        let split = vec!["tool".to_string(), "a".to_string(), "b".to_string()];
+        assert_ne!(command_identity(&combined), command_identity(&split));
+    }
 
     #[test]
     fn prefix_resolution_handles_zero_one_many() {
