@@ -3,10 +3,11 @@ use chrono::{DateTime, Local, SecondsFormat};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const SUMMARY_SCHEMA_VERSION: u32 = 1;
 pub const INDEX_SCHEMA_VERSION: u32 = 1;
@@ -176,36 +177,114 @@ pub fn command_kind(argv: &[String]) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+pub fn resolve_command(command: &str) -> PathBuf {
+    resolve_command_from(
+        command,
+        std::env::var_os("PATH"),
+        std::env::var("PATHEXT").ok(),
+    )
+}
+
+fn resolve_command_from(command: &str, path: Option<OsString>, pathext: Option<String>) -> PathBuf {
+    let command_path = PathBuf::from(command);
+    if is_path_like(command) {
+        return resolve_path_like_command(&command_path, pathext.as_deref())
+            .unwrap_or(command_path);
+    }
+
+    let Some(path) = path else {
+        return command_path;
+    };
+    for dir in std::env::split_paths(&path) {
+        for candidate_name in command_candidates(command, pathext.as_deref()) {
+            let candidate = dir.join(candidate_name);
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+    command_path
+}
+
+fn resolve_path_like_command(command: &Path, pathext: Option<&str>) -> Option<PathBuf> {
+    if command.is_file() {
+        return Some(command.to_path_buf());
+    }
+    if cfg!(windows) && command.extension().is_none() {
+        for ext in pathext_extensions(pathext) {
+            let candidate = command.with_extension(ext.trim_start_matches('.'));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+fn command_candidates(command: &str, pathext: Option<&str>) -> Vec<String> {
+    if !cfg!(windows) || Path::new(command).extension().is_some() {
+        return vec![command.to_string()];
+    }
+    pathext_extensions(pathext)
+        .into_iter()
+        .map(|ext| format!("{command}{ext}"))
+        .collect()
+}
+
+fn pathext_extensions(pathext: Option<&str>) -> Vec<String> {
+    pathext
+        .unwrap_or(".COM;.EXE;.BAT;.CMD")
+        .split(';')
+        .filter_map(|ext| {
+            let ext = ext.trim();
+            if ext.is_empty() {
+                None
+            } else if ext.starts_with('.') {
+                Some(ext.to_string())
+            } else {
+                Some(format!(".{ext}"))
+            }
+        })
+        .collect()
+}
+
+fn is_path_like(command: &str) -> bool {
+    command.contains('/') || command.contains('\\') || Path::new(command).is_absolute()
+}
+
 pub struct RawLog<'a> {
     pub path: &'a Path,
     pub sidecar_hint: &'a str,
     pub command: &'a str,
     pub cwd: &'a Path,
-    pub stdout: &'a str,
-    pub stderr: &'a str,
+    pub stdout: &'a [u8],
+    pub stderr: &'a [u8],
     pub exit_code: i32,
     pub elapsed: &'a str,
 }
 
 pub fn write_raw_log(record: RawLog<'_>) -> Result<()> {
-    let mut body = String::new();
-    body.push_str("KDS raw command log\n");
-    body.push_str(&format!("Command: {}\n", record.command));
-    body.push_str(&format!("CWD: {}\n", record.cwd.display()));
-    body.push_str(&format!("Exit code: {}\n", record.exit_code));
-    body.push_str(&format!("Elapsed: {}\n", record.elapsed));
-    body.push_str(&format!("Summary: {}\n", record.sidecar_hint));
-    body.push_str("\n--- stdout ---\n");
-    body.push_str(record.stdout);
-    if !record.stdout.ends_with('\n') {
-        body.push('\n');
+    let mut file = fs::File::create(record.path)
+        .with_context(|| format!("write raw log {}", record.path.display()))?;
+    write!(
+        file,
+        "KDS raw command log\nCommand: {}\nCWD: {}\nExit code: {}\nElapsed: {}\nSummary: {}\n\n--- stdout ---\n",
+        record.command,
+        record.cwd.display(),
+        record.exit_code,
+        record.elapsed,
+        record.sidecar_hint
+    )?;
+    file.write_all(record.stdout)?;
+    if !record.stdout.ends_with(b"\n") {
+        file.write_all(b"\n")?;
     }
-    body.push_str("\n--- stderr ---\n");
-    body.push_str(record.stderr);
-    if !record.stderr.ends_with('\n') {
-        body.push('\n');
+    file.write_all(b"\n--- stderr ---\n")?;
+    file.write_all(record.stderr)?;
+    if !record.stderr.ends_with(b"\n") {
+        file.write_all(b"\n")?;
     }
-    fs::write(record.path, body).with_context(|| format!("write raw log {}", record.path.display()))
+    Ok(())
 }
 
 pub fn write_sidecar(path: &Path, sidecar: &SummarySidecar) -> Result<()> {
@@ -253,11 +332,7 @@ pub fn read_index(paths: &Paths) -> Vec<IndexEntry> {
 pub fn resolve_run_id(paths: &Paths, query: &str) -> Result<IndexEntry> {
     let matches: Vec<IndexEntry> = read_index(paths)
         .into_iter()
-        .filter(|entry| {
-            entry.run_id.starts_with(query)
-                || entry.run_id.ends_with(query)
-                || entry.run_id.contains(query)
-        })
+        .filter(|entry| entry.run_id.starts_with(query) || run_hash(&entry.run_id) == Some(query))
         .collect();
     match matches.len() {
         0 => anyhow::bail!("run id `{query}` not found"),
@@ -270,6 +345,10 @@ pub fn resolve_run_id(paths: &Paths, query: &str) -> Result<IndexEntry> {
             anyhow::bail!("ambiguous run id")
         }
     }
+}
+
+fn run_hash(run_id: &str) -> Option<&str> {
+    run_id.rsplit_once('-').map(|(_, hash)| hash)
 }
 
 pub fn last_run(paths: &Paths) -> Result<IndexEntry> {
@@ -313,6 +392,59 @@ pub fn write_metrics(paths: &Paths, metrics: &Metrics) -> Result<()> {
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
     write_json_atomic(&paths.metrics, metrics)
+}
+
+pub fn with_state_lock<T>(paths: &Paths, action: impl FnOnce() -> Result<T>) -> Result<T> {
+    fs::create_dir_all(&paths.state_dir)
+        .with_context(|| format!("create {}", paths.state_dir.display()))?;
+    let _guard = StateLock::acquire(paths.state_dir.join("state.lock"))?;
+    action()
+}
+
+struct StateLock {
+    path: PathBuf,
+}
+
+impl StateLock {
+    fn acquire(path: PathBuf) -> Result<Self> {
+        let start = Instant::now();
+        loop {
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(mut file) => {
+                    writeln!(file, "pid={}", std::process::id())
+                        .with_context(|| format!("write {}", path.display()))?;
+                    return Ok(Self { path });
+                }
+                Err(err) if err.kind() == ErrorKind::AlreadyExists => {
+                    if is_stale_lock(&path) {
+                        let _ = fs::remove_file(&path);
+                        continue;
+                    }
+                    if start.elapsed() > Duration::from_secs(10) {
+                        anyhow::bail!("timed out waiting for state lock {}", path.display());
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                Err(err) => {
+                    return Err(err).with_context(|| format!("create {}", path.display()));
+                }
+            }
+        }
+    }
+}
+
+impl Drop for StateLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn is_stale_lock(path: &Path) -> bool {
+    path.metadata()
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age > Duration::from_secs(600))
 }
 
 pub fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
@@ -444,6 +576,62 @@ mod tests {
             resolve_run_id(&paths, "a1b2c3").unwrap().run_id,
             first.run_id
         );
+        assert!(resolve_run_id(&paths, "1b2c3").is_err());
         assert!(resolve_run_id(&paths, "node-version").is_err());
+    }
+
+    #[test]
+    fn resolves_windows_pathext_command_shims() {
+        if !cfg!(windows) {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let shim = dir.path().join("foo.cmd");
+        fs::write(&shim, "@echo off\r\necho shim:%1\r\n").unwrap();
+
+        let resolved = resolve_command_from(
+            "foo",
+            Some(dir.path().as_os_str().to_os_string()),
+            Some(".COM;.EXE;.BAT;.CMD".to_string()),
+        );
+        assert_eq!(
+            resolved.canonicalize().unwrap(),
+            shim.canonicalize().unwrap()
+        );
+        let output = std::process::Command::new(&resolved)
+            .arg("ok")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "shim:ok");
+
+        let path_like = dir.path().join("foo");
+        let resolved_path_like =
+            resolve_command_from(path_like.to_str().unwrap(), None, Some(".CMD".to_string()));
+        assert_eq!(
+            resolved_path_like.canonicalize().unwrap(),
+            shim.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn raw_logs_preserve_non_utf8_output_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raw.log");
+        write_raw_log(RawLog {
+            path: &path,
+            sidecar_hint: "hint",
+            command: "cmd",
+            cwd: dir.path(),
+            stdout: &[0xff, 0x00, b'a'],
+            stderr: &[0xfe, b'b'],
+            exit_code: 1,
+            elapsed: "1ms",
+        })
+        .unwrap();
+        let bytes = fs::read(path).unwrap();
+        assert!(bytes.windows(3).any(|window| window == [0xff, 0x00, b'a']));
+        assert!(bytes.windows(2).any(|window| window == [0xfe, b'b']));
     }
 }

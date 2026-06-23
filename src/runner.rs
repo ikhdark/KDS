@@ -40,9 +40,10 @@ pub fn run(argv: Vec<String>, mode: Mode) -> Result<i32> {
     let paths = Paths::discover()?;
     let run_paths = paths.prepare_run_paths(&safe_argv, &cwd, started)?;
     let command_kind = storage::command_kind(&argv);
+    let program = storage::resolve_command(&argv[0]);
 
     let begin = Instant::now();
-    let output = Command::new(&argv[0]).args(&argv[1..]).output();
+    let output = Command::new(&program).args(&argv[1..]).output();
     let elapsed_duration = begin.elapsed();
     let elapsed = format_elapsed(elapsed_duration.as_millis());
 
@@ -99,8 +100,8 @@ pub fn run(argv: Vec<String>, mode: Mode) -> Result<i32> {
         sidecar_hint: log_hint,
         command: &command,
         cwd: &cwd,
-        stdout: &stdout,
-        stderr: &stderr,
+        stdout: &output.stdout,
+        stderr: &output.stderr,
         exit_code,
         elapsed: &elapsed,
     }) {
@@ -201,24 +202,26 @@ pub fn run(argv: Vec<String>, mode: Mode) -> Result<i32> {
 }
 
 fn update_metrics(paths: &Paths, sidecar: &SummarySidecar) -> Result<()> {
-    let mut metrics = storage::load_metrics(paths);
-    metrics.metrics_schema_version = METRICS_SCHEMA_VERSION;
-    metrics.command_count += 1;
-    metrics.raw_line_count += sidecar.raw_total_lines as u64;
-    metrics.shown_line_count += sidecar.shown_lines as u64;
-    metrics.estimated_saved_lines += sidecar.estimated_saved_lines as u64;
-    if sidecar.exit_code != 0 {
-        metrics.failure_count += 1;
-    }
-    if sidecar.repeat_status.is_repeat {
-        metrics.repeated_failure_count += 1;
-    }
-    metrics.last_command_time = Some(sidecar.started_at.clone());
-    *metrics
-        .per_command_kind
-        .entry(sidecar.command_kind.clone())
-        .or_insert(0) += 1;
-    storage::write_metrics(paths, &metrics)
+    storage::with_state_lock(paths, || {
+        let mut metrics = storage::load_metrics(paths);
+        metrics.metrics_schema_version = METRICS_SCHEMA_VERSION;
+        metrics.command_count += 1;
+        metrics.raw_line_count += sidecar.raw_total_lines as u64;
+        metrics.shown_line_count += sidecar.shown_lines as u64;
+        metrics.estimated_saved_lines += sidecar.estimated_saved_lines as u64;
+        if sidecar.exit_code != 0 {
+            metrics.failure_count += 1;
+        }
+        if sidecar.repeat_status.is_repeat {
+            metrics.repeated_failure_count += 1;
+        }
+        metrics.last_command_time = Some(sidecar.started_at.clone());
+        *metrics
+            .per_command_kind
+            .entry(sidecar.command_kind.clone())
+            .or_insert(0) += 1;
+        storage::write_metrics(paths, &metrics)
+    })
 }
 
 fn format_elapsed(ms: u128) -> String {

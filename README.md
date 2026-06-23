@@ -77,3 +77,5 @@ long-running daemons, commands likely to print secrets, exact `rg` or
   reduction.
 - Raw mode prints captured stdout then captured stderr; exact stream
   interleaving is not preserved in V1.
+- Wrapped command output is buffered until the command exits; V1 does not stream
+  live progress.

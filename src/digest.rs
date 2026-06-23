@@ -55,6 +55,20 @@ pub fn update_repeat_state(
     log_path: &Path,
     run_id: &str,
 ) -> Result<RepeatStatus> {
+    storage::with_state_lock(paths, || {
+        update_repeat_state_locked(paths, digest, command, cwd, exit_code, log_path, run_id)
+    })
+}
+
+fn update_repeat_state_locked(
+    paths: &Paths,
+    digest: &str,
+    command: &str,
+    cwd: &str,
+    exit_code: i32,
+    log_path: &Path,
+    run_id: &str,
+) -> Result<RepeatStatus> {
     let mut index = read_digest_index(paths);
     let now = storage::iso_now();
     let current_log_path = log_path.display().to_string();

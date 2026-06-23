@@ -322,7 +322,7 @@ fn is_error_line(line: &str) -> bool {
         || lower.contains("error: ")
         || lower.contains("panicked at")
         || lower.contains("could not compile")
-        || lower.contains(" failed")
+        || lower.contains("failed to")
         || lower.starts_with("failed ")
         || lower.starts_with("traceback ")
         || lower.starts_with("e   ")
@@ -392,6 +392,12 @@ mod tests {
     fn counts_npm_warnings_at_line_start() {
         let summary = extract("npm WARN deprecated package\n", "", 0);
         assert_eq!(summary.warning_count, 1);
+    }
+
+    #[test]
+    fn does_not_treat_success_count_as_error() {
+        let summary = extract("test result: ok. 10 passed; 0 failed\n", "", 0);
+        assert_eq!(summary.error_count, 0);
     }
 
     #[test]
