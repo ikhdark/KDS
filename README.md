@@ -36,7 +36,7 @@ The bootstrap installer downloads the KDS source archive, builds it locally,
 installs `kds.exe` under `%LOCALAPPDATA%\CodexKD\bin`, adds that directory to
 the user PATH, installs the PowerShell hook, and installs or updates the Codex
 Desktop hook for detected Codex homes. It requires Rust/Cargo to be available
-on PATH.
+on PATH and does not download a prebuilt binary.
 
 After install, allowlisted noisy build and test commands such as `cargo test`
 and `npm test` are routed through KDS automatically in PowerShell and Codex

@@ -2,9 +2,9 @@
 
 KDS has no telemetry in V1.
 
-KDS makes no network calls in V1 except future explicit release installer
-downloads. Future release-download installers must verify checksums before
-installing binaries.
+KDS itself makes no network calls in V1. The public PowerShell bootstrap
+installer fetches the KDS installer script and source archive from GitHub, then
+builds KDS locally. It does not download a prebuilt binary.
 
 Raw logs are local only. They may contain secrets, local paths, usernames,
 tokens, stack traces, environment values, and file contents. Review and redact

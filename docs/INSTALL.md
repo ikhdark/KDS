@@ -9,8 +9,8 @@ irm https://raw.githubusercontent.com/ikhdark/KDS/main/scripts/bootstrap.ps1 | i
 ```
 
 The bootstrap installer downloads the KDS source archive, builds it locally,
-and runs the Windows installer from that source. Rust/Cargo must already be
-available on PATH.
+and runs the Windows installer from that source. It does not download a
+prebuilt binary. Rust/Cargo must already be available on PATH.
 
 From an existing KDS source checkout:
 
