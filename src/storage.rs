@@ -9,7 +9,7 @@ use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-pub const SUMMARY_SCHEMA_VERSION: u32 = 1;
+pub const SUMMARY_SCHEMA_VERSION: u32 = 2;
 pub const INDEX_SCHEMA_VERSION: u32 = 1;
 pub const METRICS_SCHEMA_VERSION: u32 = 1;
 
@@ -81,6 +81,12 @@ pub struct SummarySidecar {
     pub previous_exact_match_run: Option<PreviousExactMatchRun>,
     pub started_at: String,
     pub command_kind: String,
+    #[serde(default = "default_capture_mode")]
+    pub capture_mode: String,
+    #[serde(default)]
+    pub spawn_error: Option<String>,
+    #[serde(default)]
+    pub runtime_warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,6 +114,26 @@ pub struct Metrics {
     pub repeated_failure_count: u64,
     pub last_command_time: Option<String>,
     pub per_command_kind: BTreeMap<String, u64>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct StateDiagnostics {
+    pub runs_index_present: bool,
+    pub runs_index_entries: usize,
+    pub runs_index_malformed_lines: usize,
+    pub runs_index_read_errors: usize,
+    pub metrics_present: bool,
+    pub metrics_valid: bool,
+    pub digest_present: bool,
+    pub digest_valid_json: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct IndexDiagnostics {
+    present: bool,
+    entries: usize,
+    malformed_lines: usize,
+    read_errors: usize,
 }
 
 impl Paths {
@@ -158,6 +184,19 @@ impl Paths {
             summary_path,
         })
     }
+
+    pub fn cleanup_stale_temp_files(&self, stale_after: Duration) -> Result<usize> {
+        if !self.logs_dir.exists() {
+            return Ok(0);
+        }
+        let mut removed = 0;
+        cleanup_stale_temp_files_in(&self.logs_dir, stale_after, &mut removed)?;
+        Ok(removed)
+    }
+}
+
+fn default_capture_mode() -> String {
+    "stdout/stderr piped".to_string()
 }
 
 pub fn command_string(argv: &[String]) -> String {
@@ -293,7 +332,6 @@ fn is_path_like(command: &str) -> bool {
     command.contains('/') || command.contains('\\') || Path::new(command).is_absolute()
 }
 
-#[cfg(test)]
 pub struct RawLog<'a> {
     pub path: &'a Path,
     pub sidecar_hint: &'a str,
@@ -319,7 +357,6 @@ pub struct RawLogPaths<'a> {
     pub elapsed: &'a str,
 }
 
-#[cfg(test)]
 pub fn write_raw_log(record: RawLog<'_>) -> Result<()> {
     let mut file = create_private_file_new(record.path)
         .with_context(|| format!("write raw log {}", record.path.display()))?;
@@ -339,6 +376,37 @@ pub fn write_raw_log(record: RawLog<'_>) -> Result<()> {
     file.write_all(record.stderr)?;
     if !record.stderr.ends_with(b"\n") {
         file.write_all(b"\n")?;
+    }
+    Ok(())
+}
+
+fn cleanup_stale_temp_files_in(
+    path: &Path,
+    stale_after: Duration,
+    removed: &mut usize,
+) -> Result<()> {
+    for entry in fs::read_dir(path).with_context(|| format!("read {}", path.display()))? {
+        let entry = entry.with_context(|| format!("read {}", path.display()))?;
+        let child = entry.path();
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("stat {}", child.display()))?;
+        if file_type.is_dir() {
+            cleanup_stale_temp_files_in(&child, stale_after, removed)?;
+            continue;
+        }
+        if !file_type.is_file() || child.extension().and_then(|ext| ext.to_str()) != Some("tmp") {
+            continue;
+        }
+        let age = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok());
+        if age.is_some_and(|age| age >= stale_after) {
+            fs::remove_file(&child).with_context(|| format!("remove {}", child.display()))?;
+            *removed += 1;
+        }
     }
     Ok(())
 }
@@ -457,21 +525,79 @@ fn append_index_unlocked(paths: &Paths, entry: &IndexEntry) -> Result<()> {
 }
 
 pub fn read_index(paths: &Paths) -> Vec<IndexEntry> {
+    let (entries, diagnostics) = read_index_with_diagnostics(paths);
+    if diagnostics.malformed_lines > 0 || diagnostics.read_errors > 0 {
+        eprintln!(
+            "kds: skipped {} malformed run index line(s) and {} unreadable line(s)",
+            diagnostics.malformed_lines, diagnostics.read_errors
+        );
+    }
+    entries
+}
+
+fn read_index_with_diagnostics(paths: &Paths) -> (Vec<IndexEntry>, IndexDiagnostics) {
     let file = match fs::File::open(&paths.runs_index) {
         Ok(file) => file,
-        Err(_) => return Vec::new(),
+        Err(_) => return (Vec::new(), IndexDiagnostics::default()),
     };
     let mut entries = Vec::new();
-    for line in BufReader::new(file).lines().map_while(Result::ok) {
+    let mut diagnostics = IndexDiagnostics {
+        present: true,
+        ..IndexDiagnostics::default()
+    };
+    for line in BufReader::new(file).lines() {
+        let line = match line {
+            Ok(line) => line,
+            Err(_) => {
+                diagnostics.read_errors += 1;
+                continue;
+            }
+        };
         if line.trim().is_empty() {
             continue;
         }
         match serde_json::from_str::<IndexEntry>(&line) {
-            Ok(entry) => entries.push(entry),
-            Err(err) => eprintln!("kds: skipping malformed index line: {err}"),
+            Ok(entry) => {
+                diagnostics.entries += 1;
+                entries.push(entry);
+            }
+            Err(_) => diagnostics.malformed_lines += 1,
         }
     }
-    entries
+    (entries, diagnostics)
+}
+
+pub fn state_diagnostics(paths: &Paths) -> StateDiagnostics {
+    let (_, index) = read_index_with_diagnostics(paths);
+    let (metrics_present, metrics_valid) = json_file_valid::<Metrics>(&paths.metrics);
+    let (digest_present, digest_valid_json) = json_value_file_valid(&paths.digest_index);
+    StateDiagnostics {
+        runs_index_present: index.present,
+        runs_index_entries: index.entries,
+        runs_index_malformed_lines: index.malformed_lines,
+        runs_index_read_errors: index.read_errors,
+        metrics_present,
+        metrics_valid,
+        digest_present,
+        digest_valid_json,
+    }
+}
+
+fn json_file_valid<T: for<'de> Deserialize<'de>>(path: &Path) -> (bool, bool) {
+    match fs::read_to_string(path) {
+        Ok(text) => (true, serde_json::from_str::<T>(&text).is_ok()),
+        Err(_) => (false, false),
+    }
+}
+
+fn json_value_file_valid(path: &Path) -> (bool, bool) {
+    match fs::read_to_string(path) {
+        Ok(text) => (
+            true,
+            serde_json::from_str::<serde_json::Value>(&text).is_ok(),
+        ),
+        Err(_) => (false, false),
+    }
 }
 
 pub fn resolve_run_id(paths: &Paths, query: &str) -> Result<IndexEntry> {
@@ -831,6 +957,77 @@ mod tests {
         );
         assert!(resolve_run_id(&paths, "1b2c3").is_err());
         assert!(resolve_run_id(&paths, "node-version").is_err());
+    }
+
+    #[test]
+    fn malformed_index_lines_are_skipped_and_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("KDS_HOME", dir.path());
+        let paths = Paths::discover().unwrap();
+        paths.ensure_runtime_dirs().unwrap();
+        let entry = IndexEntry {
+            index_schema_version: INDEX_SCHEMA_VERSION,
+            run_id: "2026-01-01-010101-node-version-a1b2c3".into(),
+            summary_path: "one.summary.json".into(),
+            exit_code: 0,
+            command_kind: "node".into(),
+            command: "node --version".into(),
+            argv: vec!["node".into(), "--version".into()],
+            cwd: "C:/tmp".into(),
+            started_at: iso_now(),
+            log_path: "one.log".into(),
+        };
+        append_index(&paths, &entry).unwrap();
+        {
+            let mut file = OpenOptions::new()
+                .append(true)
+                .open(&paths.runs_index)
+                .unwrap();
+            writeln!(file, "{{not valid json").unwrap();
+        }
+
+        let entries = read_index(&paths);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].run_id, entry.run_id);
+        let diagnostics = state_diagnostics(&paths);
+        assert!(diagnostics.runs_index_present);
+        assert_eq!(diagnostics.runs_index_entries, 1);
+        assert_eq!(diagnostics.runs_index_malformed_lines, 1);
+    }
+
+    #[test]
+    fn invalid_metrics_and_digest_state_are_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("KDS_HOME", dir.path());
+        let paths = Paths::discover().unwrap();
+        paths.ensure_runtime_dirs().unwrap();
+        fs::write(&paths.metrics, "{not valid json").unwrap();
+        fs::write(&paths.digest_index, "{not valid json").unwrap();
+
+        let diagnostics = state_diagnostics(&paths);
+        assert!(diagnostics.metrics_present);
+        assert!(!diagnostics.metrics_valid);
+        assert!(diagnostics.digest_present);
+        assert!(!diagnostics.digest_valid_json);
+    }
+
+    #[test]
+    fn cleanup_stale_temp_files_removes_only_tmp_files_under_logs() {
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("KDS_HOME", dir.path());
+        let paths = Paths::discover().unwrap();
+        paths.ensure_runtime_dirs().unwrap();
+        let day = paths.logs_dir.join("2026-01-01");
+        fs::create_dir_all(&day).unwrap();
+        let stale = day.join("run.stdout.1.tmp");
+        let keep = day.join("run.log");
+        fs::write(&stale, "tmp").unwrap();
+        fs::write(&keep, "log").unwrap();
+
+        let removed = paths.cleanup_stale_temp_files(Duration::ZERO).unwrap();
+        assert_eq!(removed, 1);
+        assert!(!stale.exists());
+        assert!(keep.exists());
     }
 
     #[test]

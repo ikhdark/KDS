@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::thread;
 
 fn kds_bin() -> &'static str {
     env!("CARGO_BIN_EXE_kds")
@@ -205,6 +206,110 @@ fn raw_log_capture_can_be_capped_by_env() {
     assert!(
         log.contains("stdout raw log capture reached 5 bytes"),
         "log:\n{log}"
+    );
+}
+
+#[test]
+fn doctor_reports_malformed_state_without_creating_logs() {
+    let kds_home = tempfile::tempdir().unwrap();
+    let profile_dir = tempfile::tempdir().unwrap();
+    let state_dir = kds_home.path().join("state");
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(state_dir.join("runs.jsonl"), "{not valid json\n").unwrap();
+
+    let output = Command::new(kds_bin())
+        .env("KDS_HOME", kds_home.path())
+        .env(
+            "KDS_POWERSHELL_PROFILE",
+            profile_dir.path().join("profile.ps1"),
+        )
+        .arg("doctor")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(
+            "Runs index health: 0 valid run(s), 1 malformed line(s), 0 unreadable line(s)"
+        ),
+        "stdout:\n{stdout}"
+    );
+    assert!(
+        !kds_home.path().join("logs").exists(),
+        "doctor should not create logs dir"
+    );
+}
+
+#[test]
+fn spawn_failure_writes_run_artifacts() {
+    let kds_home = tempfile::tempdir().unwrap();
+
+    let output = Command::new(kds_bin())
+        .env("KDS_HOME", kds_home.path())
+        .arg("--")
+        .arg("definitely-not-a-real-kds-test-command")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stdout.starts_with("KDS\n"), "stdout:\n{stdout}");
+    assert!(
+        stdout.contains("failed; compact evidence follows"),
+        "stdout:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("kds: failed to run `definitely-not-a-real-kds-test-command`"),
+        "stderr:\n{stderr}"
+    );
+
+    let logs = collect_files(&kds_home.path().join("logs"), "log");
+    assert_eq!(logs.len(), 1, "logs: {logs:?}");
+    let summaries = collect_files(&kds_home.path().join("logs"), "json");
+    assert_eq!(summaries.len(), 1, "summaries: {summaries:?}");
+    let index = fs::read_to_string(kds_home.path().join("state").join("runs.jsonl")).unwrap();
+    assert!(
+        index.contains("definitely-not-a-real-kds-test-command"),
+        "index:\n{index}"
+    );
+}
+
+#[test]
+fn parallel_runs_keep_index_and_artifacts_consistent() {
+    let kds_home = tempfile::tempdir().unwrap();
+    let mut handles = Vec::new();
+    for _ in 0..6 {
+        let kds_home = kds_home.path().to_path_buf();
+        handles.push(thread::spawn(move || {
+            Command::new(kds_bin())
+                .env("KDS_HOME", kds_home)
+                .arg("--")
+                .arg("rustc")
+                .arg("--version")
+                .output()
+                .unwrap()
+        }));
+    }
+
+    for handle in handles {
+        let output = handle.join().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.starts_with("KDS\n"), "stdout:\n{stdout}");
+    }
+
+    let logs = collect_files(&kds_home.path().join("logs"), "log");
+    let summaries = collect_files(&kds_home.path().join("logs"), "json");
+    assert_eq!(logs.len(), 6, "logs: {logs:?}");
+    assert_eq!(summaries.len(), 6, "summaries: {summaries:?}");
+    let index = fs::read_to_string(kds_home.path().join("state").join("runs.jsonl")).unwrap();
+    assert_eq!(index.lines().count(), 6, "index:\n{index}");
+    assert_eq!(
+        index.matches("rustc --version").count(),
+        6,
+        "index:\n{index}"
     );
 }
 

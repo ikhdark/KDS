@@ -11,6 +11,16 @@ Interactive PowerShell prompts show a `KDS` prefix after the hook loads. The
 prompt marker is only a visibility signal; automatic capture still follows the
 allowlist rules below.
 
+The managed block installs PowerShell functions for allowlisted commands. If a
+user-defined PowerShell alias with the same name already takes precedence, KDS
+does not silently remove it; rename or remove that alias if automatic wrapping
+is desired for that command.
+
+The hook keeps the resolved KDS executable path internally, prepends that
+directory to the current PowerShell session PATH when needed, and invokes KDS by
+the short executable name so wrapped commands display as `kds`/`kds.exe` rather
+than the full install path.
+
 The hook must not wrap KDS itself, precise searches, interactive sessions,
 password prompts, SSH sessions, long-running daemons, or commands likely to
 print secrets.

@@ -11,17 +11,12 @@ pub fn run() -> Result<i32> {
         (metrics.estimated_saved_lines as f64 / metrics.raw_line_count as f64) * 100.0
     };
 
-    println!("KDS gain");
-    println!("Commands: {}", metrics.command_count);
-    println!("Raw lines: {}", metrics.raw_line_count);
-    println!("Shown lines: {}", metrics.shown_line_count);
-    println!("Estimated saved lines: {}", metrics.estimated_saved_lines);
-    println!("Estimated output reduction: {:.1}%", percent);
-    println!("Failures: {}", metrics.failure_count);
-    println!(
-        "Repeated failure signals: {}",
-        metrics.repeated_failure_count
-    );
+    println!("KDS usage savings");
+    println!("Commands cleaned up: {}", metrics.command_count);
+    println!("Usage savings: {:.1}%", percent);
+    println!("Full logs saved locally: yes");
+    println!("Raw command output: {} lines", metrics.raw_line_count);
+    println!("Codex saw: {} summary lines", metrics.shown_line_count);
     println!(
         "Last command: {}",
         metrics.last_command_time.as_deref().unwrap_or("none")

@@ -27,7 +27,6 @@ pub struct ExtractedOutput {
     pub stderr_lines: usize,
 }
 
-#[cfg(test)]
 pub fn extract(stdout: &str, stderr: &str, exit_code: i32) -> ExtractedSummary {
     let mut builder = SummaryBuilder::default();
     for line in stdout.lines() {
@@ -265,7 +264,7 @@ fn known_secret_re() -> &'static Regex {
 
 pub fn format_compact_with_paths(sidecar: &SummarySidecar, show_paths: bool) -> String {
     if sidecar.exit_code == 0 && sidecar.warning_count == 0 {
-        return format!(
+        let mut out = format!(
             "{COMPACT_RUN_HEADER}\nRun ID: {}\nExit code: 0\nElapsed: {}\n{}\nEstimated output reduction: {} lines ({:.1}%)\nSummary: success\nWarnings: 0\n",
             sidecar.run_id,
             sidecar.elapsed,
@@ -273,6 +272,8 @@ pub fn format_compact_with_paths(sidecar: &SummarySidecar, show_paths: bool) -> 
             sidecar.estimated_saved_lines,
             sidecar.estimated_output_reduction_percent
         );
+        append_runtime_warnings(&mut out, sidecar);
+        return out;
     }
 
     let mut out = String::new();
@@ -328,20 +329,24 @@ pub fn format_compact_with_paths(sidecar: &SummarySidecar, show_paths: bool) -> 
         &display_list(&sidecar.suggested_next_reads, sidecar, show_paths),
         5,
     );
+    append_runtime_warnings(&mut out, sidecar);
     out
 }
 
 pub fn format_safe_metadata_with_paths(sidecar: &SummarySidecar, show_paths: bool) -> String {
-    format!(
-        "KDS run\nRun ID: {}\nCommand: {}\nExit code: {}\nElapsed: {}\n{}\nDigest: {}\nRepeat: {}\nAvailable:\n  --summary\n  --errors\n  --tail\n  --file-hits\nWarning: raw logs may contain secrets, paths, tokens, stack traces, environment values, or file contents.\n",
+    let mut out = format!(
+        "KDS run\nRun ID: {}\nCommand: {}\nExit code: {}\nElapsed: {}\nCapture: {}\n{}\nDigest: {}\nRepeat: {}\nAvailable:\n  --summary\n  --errors\n  --tail\n  --file-hits\nWarning: raw logs may contain secrets, paths, tokens, stack traces, environment values, or file contents.\n",
         sidecar.run_id,
         display_text(&sidecar.command, sidecar, show_paths),
         sidecar.exit_code,
         sidecar.elapsed,
+        sidecar.capture_mode,
         log_line(sidecar, show_paths),
         sidecar.digest,
         sidecar.repeat_status.message
-    )
+    );
+    append_runtime_warnings(&mut out, sidecar);
+    out
 }
 
 pub fn format_evidence_with_paths(sidecar: &SummarySidecar, show_paths: bool) -> String {
@@ -381,6 +386,7 @@ pub fn format_evidence_with_paths(sidecar: &SummarySidecar, show_paths: bool) ->
         "Estimated output reduction: {} lines ({:.1}%)\n",
         sidecar.estimated_saved_lines, sidecar.estimated_output_reduction_percent
     ));
+    append_runtime_warnings(&mut out, sidecar);
     out
 }
 
@@ -422,10 +428,15 @@ fn is_error_line(line: &str) -> bool {
     let lower = line.to_ascii_lowercase();
     lower.contains("error[")
         || lower.contains("error:")
+        || lower.contains(": error ")
+        || lower.contains(" error ts")
         || lower.starts_with("error ")
+        || lower.starts_with("fail ")
         || lower.contains("err!")
         || lower.contains("error: ")
         || lower.contains("panicked at")
+        || lower.contains("assertionerror")
+        || lower.contains("typeerror")
         || lower.contains("could not compile")
         || lower.contains("failed to")
         || lower.starts_with("failed ")
@@ -448,6 +459,26 @@ fn extract_file_hits(text: &str, cap: usize) -> Vec<String> {
             break;
         }
     }
+    for caps in paren_file_hit_re().captures_iter(text) {
+        let hit = format!("{}:{}:{}", &caps[1], &caps[2], &caps[3]);
+        push_unique_cap(&mut hits, hit, cap);
+        if hits.len() >= cap {
+            break;
+        }
+    }
+    for caps in pytest_node_re().captures_iter(text) {
+        let hit = format!("{}::{}", &caps[1], &caps[2]);
+        push_unique_cap(&mut hits, hit, cap);
+        if hits.len() >= cap {
+            break;
+        }
+    }
+    for caps in fail_file_re().captures_iter(text) {
+        push_unique_cap(&mut hits, caps[1].trim().to_string(), cap);
+        if hits.len() >= cap {
+            break;
+        }
+    }
     hits
 }
 
@@ -458,6 +489,32 @@ fn file_hit_re() -> &'static Regex {
             r"(?m)([A-Za-z]:\\[^:\r\n]+|(?:\.{0,2}[\\/])?[\w .\-/\\]+\.[A-Za-z0-9_]+):(\d+)(?::(\d+))?",
         )
         .unwrap()
+    })
+}
+
+fn paren_file_hit_re() -> &'static Regex {
+    static PAREN_FILE_HIT_RE: OnceLock<Regex> = OnceLock::new();
+    PAREN_FILE_HIT_RE.get_or_init(|| {
+        Regex::new(
+            r"(?m)([A-Za-z]:\\[^(\r\n]+|(?:\.{0,2}[\\/])?[\w .\-/\\]+\.[A-Za-z0-9_]+)\((\d+),(\d+)\)",
+        )
+        .unwrap()
+    })
+}
+
+fn pytest_node_re() -> &'static Regex {
+    static PYTEST_NODE_RE: OnceLock<Regex> = OnceLock::new();
+    PYTEST_NODE_RE.get_or_init(|| {
+        Regex::new(r"(?m)(?:^|\s)((?:\.{0,2}[\\/])?[\w.\-/\\]+\.py)::([A-Za-z_][\w\[\].:-]*)")
+            .unwrap()
+    })
+}
+
+fn fail_file_re() -> &'static Regex {
+    static FAIL_FILE_RE: OnceLock<Regex> = OnceLock::new();
+    FAIL_FILE_RE.get_or_init(|| {
+        Regex::new(r"(?m)^\s*(?:FAIL|FAILED)\s+((?:\.{0,2}[\\/])?[\w .\-/\\]+\.[A-Za-z0-9_]+)")
+            .unwrap()
     })
 }
 
@@ -532,6 +589,14 @@ fn write_list(out: &mut String, items: &[String], cap: usize) {
     }
 }
 
+fn append_runtime_warnings(out: &mut String, sidecar: &SummarySidecar) {
+    if sidecar.runtime_warnings.is_empty() {
+        return;
+    }
+    out.push_str("Runtime warnings:\n");
+    write_list(out, &sidecar.runtime_warnings, 5);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -577,6 +642,9 @@ mod tests {
             previous_exact_match_run: None,
             started_at: "2026-01-01T00:00:00Z".into(),
             command_kind: "cargo".into(),
+            capture_mode: "stdout/stderr piped to local temp files".into(),
+            spawn_error: None,
+            runtime_warnings: Vec::new(),
         }
     }
 
@@ -588,6 +656,32 @@ mod tests {
             .file_hits
             .iter()
             .any(|hit| hit.contains("src/main.rs:10:5")));
+    }
+
+    #[test]
+    fn extracts_pytest_node_ids_and_fail_lines() {
+        let output = "FAILED tests/test_api.py::test_create_user - AssertionError: bad\nE   AssertionError: bad\n";
+        let summary = extract(output, "", 1);
+        assert!(summary.error_count >= 2);
+        assert_eq!(
+            summary.primary_failure.as_deref(),
+            Some("FAILED tests/test_api.py::test_create_user - AssertionError: bad")
+        );
+        assert!(summary
+            .file_hits
+            .iter()
+            .any(|hit| hit == "tests/test_api.py::test_create_user"));
+    }
+
+    #[test]
+    fn extracts_typescript_paren_locations() {
+        let output = "src/app/service.ts(12,7): error TS2322: Type 'string' is not assignable\n";
+        let summary = extract(output, "", 2);
+        assert!(summary.error_count > 0);
+        assert!(summary
+            .file_hits
+            .iter()
+            .any(|hit| hit == "src/app/service.ts:12:7"));
     }
 
     #[test]

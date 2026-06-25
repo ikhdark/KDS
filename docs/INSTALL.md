@@ -15,6 +15,10 @@ The installer prints every path it writes. It does not silently edit PATH. If
 the install directory is not already on PATH, it prints the command/user action
 needed.
 
+After copying the binary, the installer validates that `kds.exe` exists, that
+`kds --version` runs, that the PowerShell hook is installed unless `--no-hook`
+was requested, and whether the install directory is visible on the user PATH.
+
 Dry-run:
 
 ```powershell

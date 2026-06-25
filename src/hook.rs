@@ -134,13 +134,18 @@ fn hook_block() -> Result<String> {
         r#"{START}
 # Managed by KDS. Remove with: kds hook uninstall powershell
 $script:KdsExe = '{exe}'
+$script:KdsCommand = [System.IO.Path]::GetFileName($script:KdsExe)
+$script:KdsExeDir = Split-Path -Parent $script:KdsExe
+if ($script:KdsExeDir -and -not (($env:PATH -split ';') -contains $script:KdsExeDir)) {{
+  $env:PATH = "$script:KdsExeDir;$env:PATH"
+}}
 function KDS {{
   $kdsArgs = @($args)
   $kdsCommands = @('run','raw','gain','doctor','logs','evidence','init','hook','help')
   if ($kdsArgs.Count -gt 0 -and -not ([string]$kdsArgs[0]).StartsWith('-') -and -not ($kdsCommands -contains [string]$kdsArgs[0])) {{
     $kdsArgs = @('--') + $kdsArgs
   }}
-  & $script:KdsExe @kdsArgs
+  & $script:KdsCommand @kdsArgs
 }}
 if (-not $global:KdsPromptWrapped) {{
   $global:KdsPromptWrapped = $true
@@ -296,9 +301,17 @@ mod tests {
             block.contains("$kdsArgs = @('--', $Name) + $Rest"),
             "block:\n{block}"
         );
+        assert!(
+            block.contains("& $script:KdsCommand @kdsArgs"),
+            "block:\n{block}"
+        );
         assert!(block.contains("KDS @kdsArgs"), "block:\n{block}");
         assert!(
             !block.contains("& $script:KdsExe -- $Name @Rest"),
+            "block:\n{block}"
+        );
+        assert!(
+            !block.contains("& $script:KdsExe @kdsArgs"),
             "block:\n{block}"
         );
     }
@@ -315,6 +328,18 @@ mod tests {
         let original = "# kds-hook-end\nbefore\n# kds-hook-start\n";
         assert!(!has_block(original));
         assert_eq!(remove_block(original), original);
+    }
+
+    #[test]
+    fn upsert_block_repairs_existing_managed_block_without_duplication() {
+        let current = "before\n# kds-hook-start\nold\n# kds-hook-end\nafter\n";
+        let repaired = upsert_block(current, "# kds-hook-start\nnew\n# kds-hook-end\n");
+        assert!(repaired.contains("before"), "repaired:\n{repaired}");
+        assert!(repaired.contains("after"), "repaired:\n{repaired}");
+        assert!(repaired.contains("new"), "repaired:\n{repaired}");
+        assert!(!repaired.contains("old"), "repaired:\n{repaired}");
+        assert_eq!(repaired.matches(START).count(), 1, "repaired:\n{repaired}");
+        assert_eq!(repaired.matches(END).count(), 1, "repaired:\n{repaired}");
     }
 
     #[test]
@@ -411,6 +436,7 @@ function prompt {{ 'BASE> ' }}
 {}
 $env:PATH = '{};' + $env:PATH
 $script:KdsExe = '{}'
+$script:KdsCommand = 'kds.cmd'
 "manual-kds-command"
 KDS gain
 "manual-kds-wrap"
@@ -562,6 +588,111 @@ python scripts/test_publish_local_codex.py
                 || stdout.contains("python-script\nnative:[scripts/test_publish_local_codex.py]"),
             "stdout:\n{stdout}"
         );
+    }
+
+    #[test]
+    fn powershell_hook_uses_native_applications_despite_prior_functions() {
+        if !cfg!(windows) {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let fake_cargo = dir.path().join("cargo.cmd");
+        let fake_npm = dir.path().join("npm.cmd");
+        let fake_kds = dir.path().join("kds.cmd");
+        std::fs::write(
+            &fake_cargo,
+            "@echo off\r\n:loop\r\nif \"%~1\"==\"\" goto end\r\necho native-cargo:[%~1]\r\nshift\r\ngoto loop\r\n:end\r\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &fake_npm,
+            "@echo off\r\n:loop\r\nif \"%~1\"==\"\" goto end\r\necho native-npm:[%~1]\r\nshift\r\ngoto loop\r\n:end\r\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &fake_kds,
+            "@echo off\r\n:loop\r\nif \"%~1\"==\"\" goto end\r\necho kds:[%~1]\r\nshift\r\ngoto loop\r\n:end\r\n",
+        )
+        .unwrap();
+
+        let script_path = dir.path().join("prior-functions.ps1");
+        let mut script = std::fs::File::create(&script_path).unwrap();
+        write!(
+            script,
+            r#"
+function cargo {{ "user-cargo-function" }}
+function npm {{ "user-npm-function" }}
+{}
+$env:PATH = '{};' + $env:PATH
+$script:KdsExe = '{}'
+$script:KdsCommand = 'kds.cmd'
+"cargo-run-native"
+cargo run
+"cargo-check-wrapped"
+cargo check
+"npm-deploy-native"
+npm run deploy
+"npm-lint-wrapped"
+npm run lint
+"npm-test-wrapped"
+npm test
+"done"
+"#,
+            hook_block().unwrap(),
+            dir.path().display(),
+            fake_kds.display()
+        )
+        .unwrap();
+        drop(script);
+
+        let output = match Command::new("pwsh")
+            .arg("-NoProfile")
+            .arg("-ExecutionPolicy")
+            .arg("Bypass")
+            .arg("-File")
+            .arg(&script_path)
+            .output()
+        {
+            Ok(output) => output,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+            Err(err) => panic!("run pwsh: {err}"),
+        };
+
+        assert!(
+            output.status.success(),
+            "stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("cargo-run-native\r\nnative-cargo:[run]")
+                || stdout.contains("cargo-run-native\nnative-cargo:[run]"),
+            "stdout:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("cargo-check-wrapped\r\nkds:[--]\r\nkds:[cargo]\r\nkds:[check]")
+                || stdout.contains("cargo-check-wrapped\nkds:[--]\nkds:[cargo]\nkds:[check]"),
+            "stdout:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("npm-deploy-native\r\nnative-npm:[run]\r\nnative-npm:[deploy]")
+                || stdout.contains("npm-deploy-native\nnative-npm:[run]\nnative-npm:[deploy]"),
+            "stdout:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("npm-lint-wrapped\r\nkds:[--]\r\nkds:[npm]\r\nkds:[run]\r\nkds:[lint]")
+                || stdout.contains("npm-lint-wrapped\nkds:[--]\nkds:[npm]\nkds:[run]\nkds:[lint]"),
+            "stdout:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("npm-test-wrapped\r\nkds:[--]\r\nkds:[npm]\r\nkds:[test]")
+                || stdout.contains("npm-test-wrapped\nkds:[--]\nkds:[npm]\nkds:[test]"),
+            "stdout:\n{stdout}"
+        );
+        assert!(!stdout.contains("user-cargo-function"), "stdout:\n{stdout}");
+        assert!(!stdout.contains("user-npm-function"), "stdout:\n{stdout}");
     }
 
     #[test]

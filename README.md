@@ -18,6 +18,10 @@ scope, and it does not depend on RTK.
 - Stores `.summary.json` sidecars and `state/runs.jsonl` for fast drilldown.
 - Detects repeated failure signals and tiny deltas between exact-match runs.
 - Provides safe drilldown commands and compact evidence packs.
+- Records spawn failures as normal KDS run artifacts and cleans up stale KDS
+  temp files from prior abnormal exits.
+- Reports local install, hook, runtime path, and state-file health with
+  `kds doctor`.
 
 ## Quick Start
 
@@ -94,8 +98,8 @@ long-running daemons, commands likely to print secrets, exact `rg` or
 
 - No telemetry.
 - No stored raw-log display command.
-- No exact token-savings claims; KDS reports estimated line-based output
-  reduction.
+- No exact token-savings claims; `kds gain` reports usage savings as estimated
+  line-based output reduction.
 - Raw mode prints captured stdout then captured stderr; exact stream
   interleaving is not preserved in V1.
 - Wrapped command stdout/stderr is drained to local temp files while the command

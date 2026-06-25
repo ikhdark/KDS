@@ -3,13 +3,15 @@ use chrono::Local;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::digest;
 use crate::storage::{
-    self, IndexEntry, Paths, SummarySidecar, INDEX_SCHEMA_VERSION, METRICS_SCHEMA_VERSION,
-    SUMMARY_SCHEMA_VERSION,
+    self, IndexEntry, Paths, RunPaths, SummarySidecar, INDEX_SCHEMA_VERSION,
+    METRICS_SCHEMA_VERSION, SUMMARY_SCHEMA_VERSION,
 };
 use crate::summarize;
 
@@ -46,6 +48,7 @@ pub fn run(argv: Vec<String>, mode: Mode, show_paths: bool) -> Result<i32> {
     let safe_command_identity = storage::command_identity(&safe_argv);
     let paths = Paths::discover()?;
     let run_paths = paths.prepare_run_paths(&safe_argv, &cwd, started)?;
+    cleanup_stale_temps(&paths);
     let command_kind = storage::command_kind(&argv);
     let program = storage::resolve_command(&argv[0]);
     let raw_byte_limit = raw_byte_limit();
@@ -66,12 +69,25 @@ pub fn run(argv: Vec<String>, mode: Mode, show_paths: bool) -> Result<i32> {
     let mut child = match child {
         Ok(child) => child,
         Err(err) => {
+            let failure = format!("failed to start command: {err}");
             eprintln!("kds: failed to run `{command}`: {err}");
-            let _ = fs::remove_file(&stdout_temp_path);
-            let _ = fs::remove_file(&stderr_temp_path);
+            record_spawn_failure(SpawnFailureRecord {
+                paths: &paths,
+                run_paths: &run_paths,
+                mode,
+                command: &safe_command,
+                safe_argv: &safe_argv,
+                safe_command_identity: &safe_command_identity,
+                command_kind: &command_kind,
+                cwd: &cwd,
+                started,
+                elapsed_duration: begin.elapsed(),
+                failure: &failure,
+            });
             return Ok(1);
         }
     };
+    let child_guard = track_child(child.id());
 
     let stdout = child
         .stdout
@@ -84,7 +100,10 @@ pub fn run(argv: Vec<String>, mode: Mode, show_paths: bool) -> Result<i32> {
     let stdout_reader = spawn_pipe_copy(stdout, stdout_temp_file, raw_byte_limit);
     let stderr_reader = spawn_pipe_copy(stderr, stderr_temp_file, raw_byte_limit);
 
-    let status = child.wait()?;
+    let status = match child.wait() {
+        Ok(status) => status,
+        Err(err) => return Err(err.into()),
+    };
     let stdout_capture = join_pipe_copy("stdout", stdout_reader).unwrap_or_else(|err| {
         eprintln!("kds: stdout capture failed: {err:#}");
         PipeCapture::default()
@@ -97,11 +116,18 @@ pub fn run(argv: Vec<String>, mode: Mode, show_paths: bool) -> Result<i32> {
     let elapsed_duration = begin.elapsed();
     let elapsed = format_elapsed(elapsed_duration.as_millis());
 
-    let exit_code = match status.code() {
-        Some(code) => code,
-        None => {
-            eprintln!("kds: wrapped command did not provide a normal exit code; exiting 1");
-            1
+    let interrupted = child_guard.was_interrupted();
+    drop(child_guard);
+    let exit_code = if interrupted {
+        eprintln!("kds: interrupt received; terminated wrapped command");
+        130
+    } else {
+        match status.code() {
+            Some(code) => code,
+            None => {
+                eprintln!("kds: wrapped command did not provide a normal exit code; exiting 1");
+                1
+            }
         }
     };
 
@@ -146,6 +172,7 @@ pub fn run(argv: Vec<String>, mode: Mode, show_paths: bool) -> Result<i32> {
     );
 
     let log_hint = "full stdout/stderr sections preserved below";
+    let mut runtime_warnings = Vec::new();
     if let Err(err) = storage::write_raw_log_from_paths(storage::RawLogPaths {
         path: &run_paths.log_path,
         sidecar_hint: log_hint,
@@ -159,7 +186,7 @@ pub fn run(argv: Vec<String>, mode: Mode, show_paths: bool) -> Result<i32> {
         exit_code,
         elapsed: &elapsed,
     }) {
-        eprintln!("kds: raw log write failed: {err:#}");
+        record_runtime_warning(&mut runtime_warnings, "raw log write failed", &err);
     }
 
     let repeat_status = match digest::update_repeat_state(
@@ -217,6 +244,9 @@ pub fn run(argv: Vec<String>, mode: Mode, show_paths: bool) -> Result<i32> {
         previous_exact_match_run: previous_match,
         started_at: started.to_rfc3339(),
         command_kind: command_kind.clone(),
+        capture_mode: "stdout/stderr piped to local temp files".to_string(),
+        spawn_error: None,
+        runtime_warnings,
     };
 
     let display_once = summarize::format_compact_with_paths(&sidecar, show_paths);
@@ -230,12 +260,9 @@ pub fn run(argv: Vec<String>, mode: Mode, show_paths: bool) -> Result<i32> {
         print!("{display}");
     }
 
-    if let Err(err) = storage::write_sidecar(&run_paths.summary_path, &sidecar) {
-        eprintln!("kds: sidecar write failed: {err:#}");
-    }
     let entry = IndexEntry {
         index_schema_version: INDEX_SCHEMA_VERSION,
-        run_id: run_paths.run_id,
+        run_id: run_paths.run_id.clone(),
         summary_path: run_paths.summary_path.display().to_string(),
         exit_code,
         command_kind,
@@ -245,12 +272,7 @@ pub fn run(argv: Vec<String>, mode: Mode, show_paths: bool) -> Result<i32> {
         started_at: sidecar.started_at.clone(),
         log_path: run_paths.log_path.display().to_string(),
     };
-    if let Err(err) = storage::append_index(&paths, &entry) {
-        eprintln!("kds: run index write failed: {err:#}");
-    }
-    if let Err(err) = update_metrics(&paths, &sidecar) {
-        eprintln!("kds: metrics write failed: {err:#}");
-    }
+    write_sidecar_index_metrics(&paths, &run_paths, &sidecar, &entry);
 
     Ok(exit_code)
 }
@@ -354,6 +376,246 @@ fn update_metrics(paths: &Paths, sidecar: &SummarySidecar) -> Result<()> {
             .or_insert(0) += 1;
         storage::write_metrics(paths, &metrics)
     })
+}
+
+struct SpawnFailureRecord<'a> {
+    paths: &'a Paths,
+    run_paths: &'a RunPaths,
+    mode: Mode,
+    command: &'a str,
+    safe_argv: &'a [String],
+    safe_command_identity: &'a str,
+    command_kind: &'a str,
+    cwd: &'a std::path::Path,
+    started: chrono::DateTime<Local>,
+    elapsed_duration: Duration,
+    failure: &'a str,
+}
+
+fn record_spawn_failure(record: SpawnFailureRecord<'_>) {
+    let exit_code = 1;
+    let elapsed = format_elapsed(record.elapsed_duration.as_millis());
+    let failure = summarize::redact_sensitive_text(record.failure);
+    let extracted = summarize::extract("", &failure, exit_code);
+    let cwd_string = record.cwd.display().to_string();
+    let digest = digest::make_digest(
+        record.command_kind,
+        record.safe_command_identity,
+        &cwd_string,
+        exit_code,
+        &extracted,
+    );
+    let repeat_status = match digest::update_repeat_state(
+        record.paths,
+        &digest,
+        record.safe_command_identity,
+        &cwd_string,
+        exit_code,
+        &record.run_paths.log_path,
+        &record.run_paths.run_id,
+    ) {
+        Ok(status) => status,
+        Err(err) => {
+            eprintln!("kds: digest state write failed: {err:#}");
+            storage::RepeatStatus {
+                is_repeat: false,
+                message: "digest state unavailable".to_string(),
+                first_seen: None,
+                previous_log_path: None,
+                current_log_path: record.run_paths.log_path.display().to_string(),
+                repeat_count: 0,
+            }
+        }
+    };
+
+    let mut runtime_warnings = Vec::new();
+    if let Err(err) = storage::write_raw_log(storage::RawLog {
+        path: &record.run_paths.log_path,
+        sidecar_hint: "command did not start; no child stdout/stderr captured",
+        command: record.command,
+        cwd: record.cwd,
+        stdout: b"",
+        stderr: failure.as_bytes(),
+        exit_code,
+        elapsed: &elapsed,
+    }) {
+        record_runtime_warning(&mut runtime_warnings, "raw log write failed", &err);
+    }
+
+    let mut sidecar = SummarySidecar {
+        summary_schema_version: SUMMARY_SCHEMA_VERSION,
+        kds_version: env!("CARGO_PKG_VERSION").to_string(),
+        run_id: record.run_paths.run_id.clone(),
+        summary_path: record.run_paths.summary_path.display().to_string(),
+        command: record.command.to_string(),
+        argv: record.safe_argv.to_vec(),
+        cwd: cwd_string.clone(),
+        mode: record.mode.as_str().to_string(),
+        exit_code,
+        elapsed: elapsed.clone(),
+        elapsed_ms: record.elapsed_duration.as_millis(),
+        digest: digest.clone(),
+        repeat_status,
+        raw_stdout_lines: 0,
+        raw_stderr_lines: storage::line_count(&failure),
+        raw_total_lines: storage::line_count(&failure),
+        shown_lines: 0,
+        estimated_saved_lines: 0,
+        estimated_output_reduction_percent: 0.0,
+        error_count: extracted.error_count,
+        warning_count: extracted.warning_count,
+        primary_failure: extracted.primary_failure,
+        delta: None,
+        top_errors: extracted.top_errors,
+        file_hits: extracted.file_hits,
+        tail: extracted.tail,
+        suggested_next_reads: extracted.suggested_next_reads,
+        log_path: record.run_paths.log_path.display().to_string(),
+        previous_exact_match_run: None,
+        started_at: record.started.to_rfc3339(),
+        command_kind: record.command_kind.to_string(),
+        capture_mode: "not started; spawn failed".to_string(),
+        spawn_error: Some(failure),
+        runtime_warnings,
+    };
+
+    let display_once = summarize::format_compact_with_paths(&sidecar, false);
+    sidecar.shown_lines = storage::line_count(&display_once);
+    sidecar.estimated_saved_lines = sidecar.raw_total_lines.saturating_sub(sidecar.shown_lines);
+    sidecar.estimated_output_reduction_percent =
+        storage::display_percent(sidecar.estimated_saved_lines, sidecar.raw_total_lines);
+    if record.mode == Mode::Compact {
+        print!("{}", summarize::format_compact_with_paths(&sidecar, false));
+    }
+
+    let entry = IndexEntry {
+        index_schema_version: INDEX_SCHEMA_VERSION,
+        run_id: record.run_paths.run_id.clone(),
+        summary_path: record.run_paths.summary_path.display().to_string(),
+        exit_code,
+        command_kind: record.command_kind.to_string(),
+        command: record.command.to_string(),
+        argv: record.safe_argv.to_vec(),
+        cwd: cwd_string,
+        started_at: sidecar.started_at.clone(),
+        log_path: record.run_paths.log_path.display().to_string(),
+    };
+    write_sidecar_index_metrics(record.paths, record.run_paths, &sidecar, &entry);
+}
+
+fn write_sidecar_index_metrics(
+    paths: &Paths,
+    run_paths: &RunPaths,
+    sidecar: &SummarySidecar,
+    entry: &IndexEntry,
+) {
+    if let Err(err) = storage::write_sidecar(&run_paths.summary_path, sidecar) {
+        eprintln!("kds: sidecar write failed: {err:#}; wrapped exit code preserved");
+    }
+    if let Err(err) = storage::append_index(paths, entry) {
+        eprintln!("kds: run index write failed: {err:#}; wrapped exit code preserved");
+    }
+    if let Err(err) = update_metrics(paths, sidecar) {
+        eprintln!("kds: metrics write failed: {err:#}; wrapped exit code preserved");
+    }
+}
+
+fn record_runtime_warning(warnings: &mut Vec<String>, label: &str, err: &anyhow::Error) {
+    let warning = summarize::redact_sensitive_text(&format!("{label}: {err:#}"));
+    eprintln!("kds: {warning}; wrapped exit code preserved");
+    warnings.push(warning);
+}
+
+fn cleanup_stale_temps(paths: &Paths) {
+    let stale_after = stale_temp_after();
+    match paths.cleanup_stale_temp_files(stale_after) {
+        Ok(0) => {}
+        Ok(removed) => eprintln!("kds: removed {removed} stale temp file(s)"),
+        Err(err) => eprintln!("kds: stale temp cleanup failed: {err:#}"),
+    }
+}
+
+fn stale_temp_after() -> Duration {
+    match std::env::var("KDS_STALE_TMP_SECS") {
+        Ok(raw) => match raw.parse::<u64>() {
+            Ok(seconds) => Duration::from_secs(seconds),
+            Err(_) => {
+                eprintln!("kds: ignoring invalid KDS_STALE_TMP_SECS={raw:?}");
+                Duration::from_secs(24 * 60 * 60)
+            }
+        },
+        Err(_) => Duration::from_secs(24 * 60 * 60),
+    }
+}
+
+struct ProcessTracker {
+    child_pid: AtomicU32,
+    interrupted: AtomicBool,
+}
+
+struct ChildProcessGuard {
+    tracker: Arc<ProcessTracker>,
+}
+
+fn process_tracker() -> Arc<ProcessTracker> {
+    static TRACKER: OnceLock<Arc<ProcessTracker>> = OnceLock::new();
+    TRACKER
+        .get_or_init(|| {
+            let tracker = Arc::new(ProcessTracker {
+                child_pid: AtomicU32::new(0),
+                interrupted: AtomicBool::new(false),
+            });
+            let handler_tracker = tracker.clone();
+            if let Err(err) = ctrlc::set_handler(move || {
+                handler_tracker.interrupted.store(true, Ordering::SeqCst);
+                let pid = handler_tracker.child_pid.load(Ordering::SeqCst);
+                if pid != 0 {
+                    terminate_process_tree(pid);
+                }
+            }) {
+                eprintln!("kds: failed to install interrupt handler: {err}");
+            }
+            tracker
+        })
+        .clone()
+}
+
+fn track_child(pid: u32) -> ChildProcessGuard {
+    let tracker = process_tracker();
+    tracker.interrupted.store(false, Ordering::SeqCst);
+    tracker.child_pid.store(pid, Ordering::SeqCst);
+    ChildProcessGuard { tracker }
+}
+
+impl ChildProcessGuard {
+    fn was_interrupted(&self) -> bool {
+        self.tracker.interrupted.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for ChildProcessGuard {
+    fn drop(&mut self) {
+        self.tracker.child_pid.store(0, Ordering::SeqCst);
+    }
+}
+
+fn terminate_process_tree(pid: u32) {
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(unix)]
+    {
+        let _ = Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
 }
 
 fn format_elapsed(ms: u128) -> String {
