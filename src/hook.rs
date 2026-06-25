@@ -141,7 +141,7 @@ if ($script:KdsExeDir -and -not (($env:PATH -split ';') -contains $script:KdsExe
 }}
 function KDS {{
   $kdsArgs = @($args)
-  $kdsCommands = @('run','raw','gain','doctor','logs','evidence','init','hook','help')
+  $kdsCommands = @('run','raw','gain','gc','prune','doctor','logs','evidence','init','hook','help')
   if ($kdsArgs.Count -gt 0 -and -not ([string]$kdsArgs[0]).StartsWith('-') -and -not ($kdsCommands -contains [string]$kdsArgs[0])) {{
     $kdsArgs = @('--') + $kdsArgs
   }}
@@ -294,7 +294,7 @@ mod tests {
         let block = hook_block().unwrap();
         assert!(block.contains("function KDS {"), "block:\n{block}");
         assert!(
-            block.contains("$kdsCommands = @('run','raw','gain','doctor','logs','evidence','init','hook','help')"),
+            block.contains("$kdsCommands = @('run','raw','gain','gc','prune','doctor','logs','evidence','init','hook','help')"),
             "block:\n{block}"
         );
         assert!(

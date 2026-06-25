@@ -25,20 +25,20 @@ is desired for that command.
 
 The hook keeps the resolved KDS executable path internally, prepends that
 directory to the current PowerShell session PATH when needed, and invokes KDS by
-the short executable name so wrapped commands display as `kds`/`kds.exe` rather
-than the full install path.
+the short command name so wrapped commands display as `KDS` rather than the full
+install path.
 
 The hook must not wrap KDS itself, precise searches, interactive sessions,
 password prompts, SSH sessions, long-running daemons, or commands likely to
 print secrets.
 
-Git commands are not wrapped automatically because `git status` output is often
-captured by scripts, prompt themes, and other tools. Run `kds -- git status`
-explicitly when KDS capture is desired.
+Git commands are not wrapped automatically because their output is often
+captured by scripts, prompt themes, readiness checks, and other tools.
 
-`git diff ...` is an exact-output workflow. If it is accidentally invoked
-through KDS, KDS passes it through to native Git without writing KDS run
-artifacts.
+Proof-style Git commands are exact-output workflows. If `git status`,
+`git rev-parse`, `git hash-object`, `git diff ...`, or `git log --oneline` is
+accidentally invoked through KDS, KDS passes it through to native Git without
+writing KDS run artifacts.
 
 For readiness workflows, keep exact evidence commands native. Do not route
 proof-line commands through KDS when their output is the deliverable, including
@@ -55,7 +55,7 @@ For Python, the automatic hook wraps test runners only: `pytest`,
 natively because they may be interactive, long-running, or print sensitive
 operational output.
 
-The Codex Desktop hook rewrites matched shell commands to `kds.exe -- ...` so
+The Codex Desktop hook rewrites matched shell commands to `KDS -- ...` so
 Desktop status text shows the short KDS command rather than the full local
 install path. It only rewrites simple commands without shell control operators.
 

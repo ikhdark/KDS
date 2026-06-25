@@ -10,8 +10,8 @@ Raw logs are local only. They may contain secrets, local paths, usernames,
 tokens, stack traces, environment values, and file contents. Review and redact
 raw logs before sharing them.
 
-KDS summary, evidence, gain, doctor, and log-index commands are designed not to
-print raw stdout/stderr bodies by default.
+KDS summary, evidence, gain, doctor, log-index, log-stats, GC, and prune
+commands are designed not to print raw stdout/stderr bodies by default.
 
 Default compact, logs, and evidence output also avoids absolute log and CWD
 paths. It prints the run ID and local drilldown commands such as
@@ -35,3 +35,7 @@ Set `KDS_MAX_RAW_BYTES` to a positive byte count to cap persisted raw stdout
 and stderr per stream. KDS continues draining output after the cap and writes a
 truncation note into the raw log. Unset it or set it to `0` for unlimited raw
 capture.
+
+Set `KDS_RETENTION_DAYS` or `KDS_MAX_TOTAL_LOG_BYTES` to prune old local KDS
+artifacts automatically on run start. Set `KDS_COMPRESS_AFTER_DAYS` to gzip
+older raw `.log` files and update matching sidecars to the compressed path.

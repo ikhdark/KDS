@@ -14,9 +14,14 @@ only when you need it.
 - Shows a short summary first instead of dumping the whole command output.
 - Avoids absolute log paths and working-directory paths by default.
 - Stores `.summary.json` sidecars and `state/runs.jsonl` for later drilldown.
-- Spots repeated failure signals and small deltas between matching runs.
+- Spots repeated failure signals and small deltas between matching runs, with
+  shorter output for unchanged repeat failures.
 - Gives you safe follow-up commands for logs, evidence packs, and local health
   checks.
+- Reports PowerShell hook, Codex Desktop hook, Desktop hook trust, and local
+  state health with `kds doctor`.
+- Shows safe local log storage stats and can prune old local KDS artifacts.
+- Tracks line, character, and approximate token reduction locally.
 - Records spawn failures as normal KDS runs and cleans up stale temp files from
   prior abnormal exits.
 
@@ -31,10 +36,10 @@ The full output is still saved locally, so you are not throwing evidence away.
 You only pull the raw log, error slice, or evidence pack when it is actually
 needed.
 
-`kds gain` reports an estimated line-based reduction: how many raw output lines
-were captured versus how many lines KDS showed first. It is not an exact token
-counter, but it gives you a practical read on how much terminal noise KDS kept
-out of the conversation.
+`kds gain` reports estimated line and character reduction, plus approximate
+token reduction using a simple chars/4 estimate. It is not an exact tokenizer,
+but it gives you a practical read on how much terminal noise KDS kept out of
+the conversation and which commands are worth wrapping.
 
 ## Quick Start
 
@@ -60,6 +65,7 @@ You can also run KDS directly:
 ```powershell
 kds -- cargo test
 kds run -- npm test
+kds run --budget tight -- cargo test
 kds raw -- node --version
 ```
 
@@ -68,10 +74,17 @@ kds raw -- node --version
 ```powershell
 kds gain
 kds logs dir
+kds logs stats
 kds logs last
 kds logs show <run-id> --show-paths
 kds logs show <run-id> --errors
+kds logs show last --error-window
+kds logs show <run-id> --error-window
 kds evidence last
+kds gc --older-than 30d --dry-run
+kds gc --older-than 30d
+kds prune --before 30d --dry-run
+kds doctor
 kds hook status
 kds hook uninstall powershell
 ```
@@ -95,6 +108,11 @@ raw stdout and stderr per stream. KDS still drains child output after the cap so
 the wrapped command does not block. Unset it or set it to `0` for unlimited raw
 capture.
 
+Use `KDS_RETENTION_DAYS` to prune old local run artifacts on run start, and
+`KDS_MAX_TOTAL_LOG_BYTES` to keep local KDS artifacts under a disk budget.
+`KDS_COMPRESS_AFTER_DAYS` gzips older raw `.log` files and updates matching
+sidecars to point at the compressed path.
+
 KDS redacts common token, API key, password, bearer-token, and URL credential
 patterns from summaries, evidence, sidecars, and indexes. That is a guardrail,
 not a promise that every possible secret-like value was found.
@@ -106,8 +124,10 @@ point of the command, such as readiness evidence, `git status`,
 `git diff --name-only`, `git diff --check`, tracked diff hash commands, or
 publish/install proof lines.
 
-If `git diff ...` is accidentally run through KDS, KDS passes it through to
-native Git and does not write KDS run artifacts.
+If proof-style Git commands are accidentally run through KDS, KDS passes them
+through to native Git and does not write KDS run artifacts. That includes
+`git status`, `git rev-parse`, `git hash-object`, `git diff ...`, and
+`git log --oneline`.
 
 Do not use KDS for interactive commands, password prompts, SSH sessions,
 long-running daemons, commands likely to print secrets, exact `rg` or
@@ -117,10 +137,9 @@ long-running daemons, commands likely to print secrets, exact `rg` or
 
 - No telemetry.
 - No stored raw-log display command.
-- No exact token-savings claims. `kds gain` reports estimated line-based output
-  reduction.
-- Raw mode prints captured stdout and then captured stderr; exact stream
-  interleaving is not preserved in V1.
-- Wrapped stdout/stderr is drained to local temp files while the command runs,
-  then summarized from bounded line state. V1 does not stream live progress in
-  compact mode.
+- No exact token-savings claims. `kds gain` reports approximate token reduction
+  from character counts.
+- Raw mode tees stdout/stderr live while still saving local logs; exact stream
+  interleaving is best-effort.
+- Compact mode stays quiet while the command runs except for one short
+  long-running notice after the progress threshold.

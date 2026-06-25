@@ -1,11 +1,9 @@
 use regex::Regex;
 use std::collections::VecDeque;
-use std::fs;
-use std::io::{BufRead, BufReader};
-use std::path::Path;
 use std::sync::OnceLock;
 
-use crate::storage::SummarySidecar;
+use crate::cli::SummaryBudget;
+use crate::storage::{ErrorWindow, SummarySidecar};
 
 const COMPACT_RUN_HEADER: &str = "KDS";
 
@@ -18,6 +16,10 @@ pub struct ExtractedSummary {
     pub file_hits: Vec<String>,
     pub tail: Vec<String>,
     pub suggested_next_reads: Vec<String>,
+    pub error_windows: Vec<ErrorWindow>,
+    pub digest_error_lines: Vec<String>,
+    pub digest_file_hits: Vec<String>,
+    pub test_or_package_hint: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -25,66 +27,63 @@ pub struct ExtractedOutput {
     pub summary: ExtractedSummary,
     pub stdout_lines: usize,
     pub stderr_lines: usize,
+    pub stdout_chars: usize,
+    pub stderr_chars: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct StreamSummary {
+    pub builder: SummaryBuilder,
+    pub line_count: usize,
+    pub char_count: usize,
 }
 
 pub fn extract(stdout: &str, stderr: &str, exit_code: i32) -> ExtractedSummary {
-    let mut builder = SummaryBuilder::default();
+    let mut builder = SummaryBuilder::new();
     for line in stdout.lines() {
-        builder.push_line(line);
+        builder.push_stream_line("stdout", line);
     }
     for line in stderr.lines() {
-        builder.push_line(line);
+        builder.push_stream_line("stderr", line);
     }
     builder.finish(exit_code)
 }
 
-pub fn extract_from_paths(
-    stdout_path: &Path,
-    stderr_path: &Path,
-    exit_code: i32,
-) -> std::io::Result<ExtractedOutput> {
-    let mut builder = SummaryBuilder::default();
-    let stdout_lines = scan_path(stdout_path, &mut builder)?;
-    let stderr_lines = scan_path(stderr_path, &mut builder)?;
-    Ok(ExtractedOutput {
-        summary: builder.finish(exit_code),
-        stdout_lines,
-        stderr_lines,
-    })
-}
-
-fn scan_path(path: &Path, builder: &mut SummaryBuilder) -> std::io::Result<usize> {
-    let file = fs::File::open(path)?;
-    let mut reader = BufReader::new(file);
-    let mut line = Vec::new();
-    let mut lines = 0;
-    loop {
-        line.clear();
-        let bytes = reader.read_until(b'\n', &mut line)?;
-        if bytes == 0 {
-            break;
-        }
-        lines += 1;
-        let line = String::from_utf8_lossy(&line);
-        builder.push_line(line.trim_end_matches(['\r', '\n']));
-    }
-    Ok(lines)
-}
-
-#[derive(Default)]
-struct SummaryBuilder {
+#[derive(Debug, Clone, Default)]
+pub struct SummaryBuilder {
     warning_count: usize,
     error_count: usize,
     top_errors: Vec<String>,
     file_hits: Vec<String>,
     tail: VecDeque<String>,
+    before: VecDeque<String>,
+    line_number: usize,
+    error_windows: Vec<ErrorWindow>,
+    pending_error_windows: Vec<(usize, usize)>,
+    test_or_package_hint: Option<String>,
 }
 
 impl SummaryBuilder {
-    fn push_line(&mut self, raw_line: &str) {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn push_stream_line(&mut self, stream: &str, raw_line: &str) {
         let line = redact_sensitive_text(&strip_ansi(raw_line))
             .trim_end()
             .to_string();
+        self.line_number += 1;
+        let pending = std::mem::take(&mut self.pending_error_windows);
+        for (index, remaining) in pending {
+            if remaining > 0 {
+                if let Some(window) = self.error_windows.get_mut(index) {
+                    window.after.push(line.clone());
+                }
+                if remaining > 1 {
+                    self.pending_error_windows.push((index, remaining - 1));
+                }
+            }
+        }
         let lower = line.to_ascii_lowercase();
         if lower.contains("warning:")
             || lower.starts_with("warn ")
@@ -97,20 +96,53 @@ impl SummaryBuilder {
             self.error_count += 1;
         }
         if !line.trim().is_empty() {
+            if self.test_or_package_hint.is_none() {
+                self.test_or_package_hint = detect_test_or_package_hint(&line);
+            }
             if is_error_line(&line) {
+                self.push_error_window(stream, &line);
                 push_unique_cap(&mut self.top_errors, line.clone(), 8);
             }
             for hit in extract_file_hits(&line, 10) {
                 push_unique_cap(&mut self.file_hits, hit, 10);
             }
+            self.tail.push_back(line.clone());
+            if self.tail.len() > 40 {
+                self.tail.pop_front();
+            }
+            self.before.push_back(line);
+            if self.before.len() > 3 {
+                self.before.pop_front();
+            }
+        }
+    }
+
+    pub fn merge(&mut self, _line_count: usize, other: SummaryBuilder) {
+        self.warning_count += other.warning_count;
+        self.error_count += other.error_count;
+        for item in other.top_errors {
+            push_unique_cap(&mut self.top_errors, item, 8);
+        }
+        for item in other.file_hits {
+            push_unique_cap(&mut self.file_hits, item, 10);
+        }
+        for line in other.tail {
             self.tail.push_back(line);
             if self.tail.len() > 40 {
                 self.tail.pop_front();
             }
         }
+        if self.test_or_package_hint.is_none() {
+            self.test_or_package_hint = other.test_or_package_hint;
+        }
+        for window in other.error_windows {
+            if self.error_windows.len() < 3 {
+                self.error_windows.push(window);
+            }
+        }
     }
 
-    fn finish(mut self, exit_code: i32) -> ExtractedSummary {
+    pub fn finish(mut self, exit_code: i32) -> ExtractedSummary {
         if self.top_errors.is_empty() && exit_code != 0 {
             for line in self
                 .tail
@@ -127,6 +159,18 @@ impl SummaryBuilder {
         }
         let suggested_next_reads = self.file_hits.iter().take(5).cloned().collect();
         let primary_failure = self.top_errors.first().cloned();
+        let digest_error_lines = self
+            .top_errors
+            .iter()
+            .take(3)
+            .map(|line| normalize_digest_signal(line))
+            .collect();
+        let digest_file_hits = self
+            .file_hits
+            .iter()
+            .take(3)
+            .map(|line| normalize_digest_signal(line))
+            .collect();
         ExtractedSummary {
             error_count: self.error_count,
             warning_count: self.warning_count,
@@ -135,7 +179,93 @@ impl SummaryBuilder {
             file_hits: self.file_hits,
             tail: self.tail.into_iter().collect(),
             suggested_next_reads,
+            error_windows: self.error_windows,
+            digest_error_lines,
+            digest_file_hits,
+            test_or_package_hint: self.test_or_package_hint,
         }
+    }
+
+    fn push_error_window(&mut self, stream: &str, line: &str) {
+        if self.error_windows.len() >= 3 {
+            return;
+        }
+        let index = self.error_windows.len();
+        self.error_windows.push(ErrorWindow {
+            stream: stream.to_string(),
+            line: self.line_number,
+            before: self.before.iter().cloned().collect(),
+            matched: line.to_string(),
+            after: Vec::new(),
+        });
+        self.pending_error_windows.push((index, 3));
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct StreamSummaryBuilder {
+    builder: SummaryBuilder,
+    pending: Vec<u8>,
+    line_count: usize,
+    char_count: usize,
+    stream: &'static str,
+}
+
+impl StreamSummaryBuilder {
+    pub fn new(stream: &'static str) -> Self {
+        Self {
+            stream,
+            ..Self::default()
+        }
+    }
+
+    pub fn push_bytes(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            if *byte == b'\n' {
+                self.flush_pending_line();
+            } else {
+                self.pending.push(*byte);
+            }
+        }
+    }
+
+    pub fn finish(mut self) -> StreamSummary {
+        if !self.pending.is_empty() {
+            self.flush_pending_line();
+        }
+        StreamSummary {
+            builder: self.builder,
+            line_count: self.line_count,
+            char_count: self.char_count,
+        }
+    }
+
+    fn flush_pending_line(&mut self) {
+        if self.pending.last() == Some(&b'\r') {
+            let _ = self.pending.pop();
+        }
+        let line = String::from_utf8_lossy(&self.pending);
+        self.char_count += line.chars().count();
+        self.builder.push_stream_line(self.stream, &line);
+        self.line_count += 1;
+        self.pending.clear();
+    }
+}
+
+pub fn merge_stream_summaries(
+    stdout: StreamSummary,
+    stderr: StreamSummary,
+    exit_code: i32,
+) -> ExtractedOutput {
+    let mut builder = SummaryBuilder::new();
+    builder.merge(stdout.line_count, stdout.builder);
+    builder.merge(stderr.line_count, stderr.builder);
+    ExtractedOutput {
+        summary: builder.finish(exit_code),
+        stdout_lines: stdout.line_count,
+        stderr_lines: stderr.line_count,
+        stdout_chars: stdout.char_count,
+        stderr_chars: stderr.char_count,
     }
 }
 
@@ -146,6 +276,9 @@ fn strip_ansi(text: &str) -> String {
 }
 
 pub fn redact_sensitive_text(text: &str) -> String {
+    if !needs_redaction_scan(text) {
+        return text.to_string();
+    }
     let mut redacted = text.to_string();
     for (pattern, replacement) in [
         (url_credentials_re(), "${1}[redacted]@"),
@@ -159,6 +292,59 @@ pub fn redact_sensitive_text(text: &str) -> String {
         redacted = pattern.replace_all(&redacted, replacement).to_string();
     }
     redacted
+}
+
+fn needs_redaction_scan(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("token")
+        || lower.contains("secret")
+        || lower.contains("password")
+        || lower.contains("passwd")
+        || lower.contains("pwd")
+        || lower.contains("authorization")
+        || lower.contains("bearer")
+        || lower.contains("api")
+        || lower.contains("://")
+        || lower.contains("ghp_")
+        || lower.contains("github_pat_")
+        || lower.contains("glpat-")
+        || lower.contains("sk-")
+        || lower.contains("rk_live")
+        || lower.contains("rk_test")
+        || lower.contains("sk_live")
+        || lower.contains("sk_test")
+        || lower.contains("akia")
+        || lower.contains("asia")
+        || lower.contains("aiza")
+        || lower.contains("xox")
+        || lower.contains("npm_")
+        || lower.contains("eyj")
+        || looks_like_dot_secret(text)
+}
+
+fn looks_like_dot_secret(text: &str) -> bool {
+    text.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_' && ch != '-' && ch != '.')
+        .any(|token| {
+            let mut parts = token.split('.');
+            let Some(first) = parts.next() else {
+                return false;
+            };
+            let Some(second) = parts.next() else {
+                return false;
+            };
+            let Some(third) = parts.next() else {
+                return false;
+            };
+            parts.next().is_none()
+                && (23..=28).contains(&first.len())
+                && (6..=10).contains(&second.len())
+                && third.len() >= 27
+                && first
+                    .chars()
+                    .chain(second.chars())
+                    .chain(third.chars())
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+        })
 }
 
 pub fn redact_argv(argv: &[String]) -> Vec<String> {
@@ -263,19 +449,80 @@ fn known_secret_re() -> &'static Regex {
 }
 
 pub fn format_compact_with_paths(sidecar: &SummarySidecar, show_paths: bool) -> String {
+    format_compact_with_budget(sidecar, show_paths, None)
+}
+
+pub fn format_compact_with_budget(
+    sidecar: &SummarySidecar,
+    show_paths: bool,
+    budget: Option<SummaryBudget>,
+) -> String {
+    apply_output_budget(
+        format_compact_unbounded(sidecar, show_paths, budget),
+        budget,
+        &sidecar.run_id,
+    )
+}
+
+pub fn compact_line_count_with_budget(
+    sidecar: &SummarySidecar,
+    show_paths: bool,
+    budget: Option<SummaryBudget>,
+) -> usize {
+    storage_line_count(&format_compact_with_budget(sidecar, show_paths, budget))
+}
+
+fn format_compact_unbounded(
+    sidecar: &SummarySidecar,
+    show_paths: bool,
+    budget: Option<SummaryBudget>,
+) -> String {
     if sidecar.exit_code == 0 && sidecar.warning_count == 0 {
         let mut out = format!(
-            "{COMPACT_RUN_HEADER}\nRun ID: {}\nExit code: 0\nElapsed: {}\n{}\nEstimated output reduction: {} lines ({:.1}%)\nSummary: success\nWarnings: 0\n",
+            "{COMPACT_RUN_HEADER}\nRun ID: {}\nExit code: 0\nElapsed: {}\n{}\nEstimated output reduction: {} lines ({:.1}%)\nSummary: success\nNext action: {}\nWarnings: 0\n",
             sidecar.run_id,
             sidecar.elapsed,
             log_line(sidecar, show_paths),
             sidecar.estimated_saved_lines,
-            sidecar.estimated_output_reduction_percent
+            sidecar.estimated_output_reduction_percent,
+            next_action(sidecar)
         );
         append_runtime_warnings(&mut out, sidecar);
         return out;
     }
 
+    if sidecar.repeat_status.is_repeat && sidecar.exit_code != 0 && !digest_changed(sidecar) {
+        let mut out = String::new();
+        out.push_str(COMPACT_RUN_HEADER);
+        out.push('\n');
+        out.push_str(&format!("Run ID: {}\n", sidecar.run_id));
+        out.push_str(&format!("Exit code: {}\n", sidecar.exit_code));
+        out.push_str(&format!("Elapsed: {}\n", sidecar.elapsed));
+        out.push_str(&format!("Repeat: {}\n", sidecar.repeat_status.message));
+        if let Some(delta) = &sidecar.delta {
+            out.push_str(&format!("Changed since previous run: {delta}\n"));
+        }
+        out.push_str(&format!(
+            "Primary failure: {}\n",
+            sidecar
+                .primary_failure
+                .as_deref()
+                .map(|text| display_text(text, sidecar, show_paths))
+                .unwrap_or_else(|| "none".to_string())
+        ));
+        out.push_str(&format!("Next action: {}\n", next_action(sidecar)));
+        out.push_str("Suggested next read:\n");
+        write_list(&mut out, &suggested_next_commands(sidecar), 3);
+        out.push_str(&format!(
+            "Estimated savings: {} lines ({:.1}%)\n",
+            sidecar.estimated_saved_lines, sidecar.estimated_output_reduction_percent
+        ));
+        out.push_str(&format!("{}\n", log_line(sidecar, show_paths)));
+        append_runtime_warnings(&mut out, sidecar);
+        return out;
+    }
+
+    let caps = display_caps(budget);
     let mut out = String::new();
     out.push_str(COMPACT_RUN_HEADER);
     out.push('\n');
@@ -304,38 +551,35 @@ pub fn format_compact_with_paths(sidecar: &SummarySidecar, show_paths: bool) -> 
     if let Some(delta) = &sidecar.delta {
         out.push_str(&format!("Changed since previous run: {delta}\n"));
     }
+    out.push_str(&format!("Next action: {}\n", next_action(sidecar)));
     out.push_str("Top errors:\n");
     write_list(
         &mut out,
         &display_list(&sidecar.top_errors, sidecar, show_paths),
-        3,
+        caps.top_errors,
     );
     out.push_str("File hits:\n");
     write_list(
         &mut out,
         &display_list(&sidecar.file_hits, sidecar, show_paths),
-        10,
+        caps.file_hits,
     );
     out.push_str(&format!("Warnings: {}\n", sidecar.warning_count));
     out.push_str("Final tail:\n");
     write_list(
         &mut out,
         &display_list(&sidecar.tail, sidecar, show_paths),
-        40,
+        caps.tail,
     );
     out.push_str("Suggested next read:\n");
-    write_list(
-        &mut out,
-        &display_list(&sidecar.suggested_next_reads, sidecar, show_paths),
-        5,
-    );
+    write_list(&mut out, &suggested_next_commands(sidecar), caps.suggested);
     append_runtime_warnings(&mut out, sidecar);
     out
 }
 
 pub fn format_safe_metadata_with_paths(sidecar: &SummarySidecar, show_paths: bool) -> String {
     let mut out = format!(
-        "KDS run\nRun ID: {}\nCommand: {}\nExit code: {}\nElapsed: {}\nCapture: {}\n{}\nDigest: {}\nRepeat: {}\nAvailable:\n  --summary\n  --errors\n  --tail\n  --file-hits\nWarning: raw logs may contain secrets, paths, tokens, stack traces, environment values, or file contents.\n",
+        "KDS run\nRun ID: {}\nCommand: {}\nExit code: {}\nElapsed: {}\nCapture: {}\n{}\nDigest: {}\nRepeat: {}\nAvailable:\n  --summary\n  --errors\n  --error-window\n  --tail\n  --file-hits\nWarning: raw logs may contain secrets, paths, tokens, stack traces, environment values, or file contents.\n",
         sidecar.run_id,
         display_text(&sidecar.command, sidecar, show_paths),
         sidecar.exit_code,
@@ -363,6 +607,7 @@ pub fn format_evidence_with_paths(sidecar: &SummarySidecar, show_paths: bool) ->
     if let Some(delta) = &sidecar.delta {
         out.push_str(&format!("Changed since previous run: {delta}\n"));
     }
+    out.push_str(&format!("Next action: {}\n", next_action(sidecar)));
     out.push_str("Top errors:\n");
     write_list(
         &mut out,
@@ -376,11 +621,7 @@ pub fn format_evidence_with_paths(sidecar: &SummarySidecar, show_paths: bool) ->
         5,
     );
     out.push_str("Suggested next reads:\n");
-    write_list(
-        &mut out,
-        &display_list(&sidecar.suggested_next_reads, sidecar, show_paths),
-        5,
-    );
+    write_list(&mut out, &suggested_next_commands(sidecar), 5);
     out.push_str(&format!("{}\n", log_line(sidecar, show_paths)));
     out.push_str(&format!(
         "Estimated output reduction: {} lines ({:.1}%)\n",
@@ -529,6 +770,176 @@ fn log_line(sidecar: &SummarySidecar, show_paths: bool) -> String {
     }
 }
 
+fn next_action(sidecar: &SummarySidecar) -> &'static str {
+    if sidecar.spawn_error.is_some() {
+        return "spawn failure";
+    }
+    if sidecar.exit_code == 0 && sidecar.warning_count == 0 {
+        return "success";
+    }
+    if sidecar.exit_code == 0 {
+        return "success with warnings";
+    }
+    if sidecar.repeat_status.is_repeat {
+        return "repeat failure";
+    }
+
+    let evidence = sidecar
+        .top_errors
+        .iter()
+        .chain(sidecar.tail.iter())
+        .take(20)
+        .map(|line| line.to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if evidence.trim().is_empty() {
+        return "raw log needed";
+    }
+    if evidence.contains("command not found")
+        || evidence.contains("no such file or directory")
+        || evidence.contains("cannot find module")
+        || evidence.contains("module not found")
+        || evidence.contains("no module named")
+        || evidence.contains("could not find")
+        || evidence.contains("unresolved import")
+        || evidence.contains("failed to resolve")
+    {
+        return "likely missing dependency";
+    }
+    if evidence.contains("could not compile")
+        || evidence.contains("error[")
+        || evidence.contains("error ts")
+        || evidence.contains("failed to compile")
+        || evidence.contains("compilation failed")
+    {
+        return "likely compile error";
+    }
+    if evidence.contains("assertionerror")
+        || evidence.contains("assertion failed")
+        || evidence.contains("panicked at")
+        || evidence.contains("test result: failed")
+        || evidence.contains("failures:")
+        || evidence.contains(" expected ")
+    {
+        return "likely test assertion failure";
+    }
+    "new failure"
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DisplayCaps {
+    top_errors: usize,
+    file_hits: usize,
+    tail: usize,
+    suggested: usize,
+    lines: usize,
+    chars: usize,
+}
+
+fn display_caps(budget: Option<SummaryBudget>) -> DisplayCaps {
+    let mut caps = match budget.or_else(budget_from_env) {
+        Some(SummaryBudget::Tight) => DisplayCaps {
+            top_errors: 2,
+            file_hits: 3,
+            tail: 6,
+            suggested: 2,
+            lines: 18,
+            chars: 2500,
+        },
+        Some(SummaryBudget::Wide) => DisplayCaps {
+            top_errors: 5,
+            file_hits: 10,
+            tail: 40,
+            suggested: 5,
+            lines: 80,
+            chars: 12000,
+        },
+        _ => DisplayCaps {
+            top_errors: 3,
+            file_hits: 5,
+            tail: 12,
+            suggested: 3,
+            lines: 30,
+            chars: 4000,
+        },
+    };
+    if let Ok(raw) = std::env::var("KDS_SUMMARY_BUDGET_LINES") {
+        if let Ok(lines) = raw.parse::<usize>() {
+            caps.lines = lines.max(6);
+        }
+    }
+    if let Ok(raw) = std::env::var("KDS_SUMMARY_BUDGET_CHARS") {
+        if let Ok(chars) = raw.parse::<usize>() {
+            caps.chars = chars.max(500);
+        }
+    }
+    caps
+}
+
+fn budget_from_env() -> Option<SummaryBudget> {
+    match std::env::var("KDS_SUMMARY_BUDGET")
+        .ok()
+        .map(|value| value.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("tight") => Some(SummaryBudget::Tight),
+        Some("wide") => Some(SummaryBudget::Wide),
+        Some("normal") => Some(SummaryBudget::Normal),
+        _ => None,
+    }
+}
+
+fn apply_output_budget(text: String, budget: Option<SummaryBudget>, run_id: &str) -> String {
+    let caps = display_caps(budget);
+    let mut out = String::new();
+    let mut used_chars = 0;
+    let mut truncated = false;
+    for (index, line) in text.lines().enumerate() {
+        let next_chars = line.chars().count() + 1;
+        if index >= caps.lines || used_chars + next_chars > caps.chars {
+            truncated = true;
+            break;
+        }
+        out.push_str(line);
+        out.push('\n');
+        used_chars += next_chars;
+    }
+    if truncated {
+        out.push_str(&format!(
+            "Summary budget reached; use `kds logs show {run_id} --errors` or `--error-window` for more.\n",
+        ));
+    }
+    out
+}
+
+fn storage_line_count(text: &str) -> usize {
+    if text.is_empty() {
+        0
+    } else {
+        text.lines().count()
+    }
+}
+
+fn digest_changed(sidecar: &SummarySidecar) -> bool {
+    sidecar
+        .delta
+        .as_deref()
+        .map(|delta| delta.contains("digest changed"))
+        .unwrap_or(false)
+}
+
+fn suggested_next_commands(sidecar: &SummarySidecar) -> Vec<String> {
+    let mut commands = vec![
+        format!("kds logs show {} --errors", sidecar.run_id),
+        format!("kds logs show {} --error-window", sidecar.run_id),
+        format!("kds logs show {} --file-hits", sidecar.run_id),
+    ];
+    if sidecar.top_errors.is_empty() && sidecar.error_windows.is_empty() {
+        commands[0] = format!("kds logs show {} --tail", sidecar.run_id);
+    }
+    commands
+}
+
 fn display_list(items: &[String], sidecar: &SummarySidecar, show_paths: bool) -> Vec<String> {
     items
         .iter()
@@ -577,6 +988,46 @@ fn push_unique_cap(items: &mut Vec<String>, item: String, cap: usize) {
     }
 }
 
+fn normalize_digest_signal(text: &str) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(240)
+        .collect()
+}
+
+fn detect_test_or_package_hint(line: &str) -> Option<String> {
+    if let Some(caps) = rust_test_stdout_re().captures(line) {
+        return Some(format!("rust test {}", normalize_digest_signal(&caps[1])));
+    }
+    if let Some(caps) = could_not_compile_re().captures(line) {
+        return Some(format!(
+            "cargo package {}",
+            normalize_digest_signal(&caps[1])
+        ));
+    }
+    if let Some(caps) = pytest_node_re().captures(line) {
+        return Some(format!(
+            "pytest {}::{}",
+            normalize_digest_signal(&caps[1]),
+            normalize_digest_signal(&caps[2])
+        ));
+    }
+    None
+}
+
+fn rust_test_stdout_re() -> &'static Regex {
+    static RUST_TEST_STDOUT_RE: OnceLock<Regex> = OnceLock::new();
+    RUST_TEST_STDOUT_RE.get_or_init(|| Regex::new(r"^----\s+(.+?)\s+stdout\s+----$").unwrap())
+}
+
+fn could_not_compile_re() -> &'static Regex {
+    static COULD_NOT_COMPILE_RE: OnceLock<Regex> = OnceLock::new();
+    COULD_NOT_COMPILE_RE
+        .get_or_init(|| Regex::new(r#"(?i)could not compile [`']([^`']+)[`']"#).unwrap())
+}
+
 fn write_list(out: &mut String, items: &[String], cap: usize) {
     if items.is_empty() {
         out.push_str("  none\n");
@@ -616,6 +1067,8 @@ mod tests {
             elapsed: "10ms".into(),
             elapsed_ms: 10,
             digest: "digest".into(),
+            exact_digest: "exact".into(),
+            normalized_digest: "digest".into(),
             repeat_status: RepeatStatus {
                 is_repeat: false,
                 message: "new failure signal".into(),
@@ -627,9 +1080,18 @@ mod tests {
             raw_stdout_lines: 10,
             raw_stderr_lines: 5,
             raw_total_lines: 15,
+            raw_stdout_chars: 100,
+            raw_stderr_chars: 50,
+            raw_total_chars: 150,
             shown_lines: 0,
+            shown_chars: 0,
             estimated_saved_lines: 5,
+            estimated_saved_chars: 50,
             estimated_output_reduction_percent: 33.3,
+            estimated_char_reduction_percent: 33.3,
+            approx_raw_tokens: 38,
+            approx_shown_tokens: 25,
+            approx_saved_tokens: 13,
             error_count: 1,
             warning_count: 0,
             primary_failure: Some("error: C:\\Users\\tester\\repo\\src\\main.rs:1".into()),
@@ -638,10 +1100,21 @@ mod tests {
             file_hits: vec!["C:\\Users\\tester\\repo\\src\\main.rs:1".into()],
             tail: vec!["failed at C:\\Users\\tester\\repo\\src\\main.rs:1".into()],
             suggested_next_reads: vec!["C:\\Users\\tester\\repo\\src\\main.rs:1".into()],
+            error_windows: vec![ErrorWindow {
+                stream: "stderr".into(),
+                line: 1,
+                before: Vec::new(),
+                matched: "error: C:\\Users\\tester\\repo\\src\\main.rs:1".into(),
+                after: Vec::new(),
+            }],
+            digest_error_lines: vec!["error: C:\\Users\\tester\\repo\\src\\main.rs:1".into()],
+            digest_file_hits: vec!["C:\\Users\\tester\\repo\\src\\main.rs:1".into()],
+            test_or_package_hint: None,
             log_path: "C:\\Users\\tester\\kds\\run.log".into(),
             previous_exact_match_run: None,
             started_at: "2026-01-01T00:00:00Z".into(),
             command_kind: "cargo".into(),
+            summary_budget: "normal".into(),
             capture_mode: "stdout/stderr piped to local temp files".into(),
             spawn_error: None,
             runtime_warnings: Vec::new(),
@@ -711,6 +1184,7 @@ fatal: https://user:password@example.com/repo.git failed
 slack=xoxb-123456789012-123456789012-abcdefghijklmnopqrstuvwx
 google=AIzaSyB123456789012345678901234567890123
 jwt=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.sflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c
+discord=aaaaaaaaaaaaaaaaaaaaaaaa.bbbbbb.cccccccccccccccccccccccccccccc
 ";
         let summary = extract("", output, 1);
         let rendered = format!(
@@ -727,6 +1201,7 @@ jwt=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.sflKxwRJSMeKKF2QT4fwpMeJf36
         assert!(!rendered.contains("xoxb-123456789012"));
         assert!(!rendered.contains("AIzaSyB123456"));
         assert!(!rendered.contains("eyJhbGciOiJIUzI1NiJ9"));
+        assert!(!rendered.contains("aaaaaaaaaaaaaaaaaaaaaaaa.bbbbbb"));
     }
 
     #[test]

@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local, SecondsFormat};
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -9,9 +11,9 @@ use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-pub const SUMMARY_SCHEMA_VERSION: u32 = 2;
+pub const SUMMARY_SCHEMA_VERSION: u32 = 4;
 pub const INDEX_SCHEMA_VERSION: u32 = 1;
-pub const METRICS_SCHEMA_VERSION: u32 = 1;
+pub const METRICS_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone)]
 pub struct Paths {
@@ -20,6 +22,9 @@ pub struct Paths {
     pub state_dir: PathBuf,
     pub runs_index: PathBuf,
     pub digest_index: PathBuf,
+    pub digest_dir: PathBuf,
+    pub latest_by_command: PathBuf,
+    pub temp_cleanup_marker: PathBuf,
     pub metrics: PathBuf,
 }
 
@@ -48,6 +53,15 @@ pub struct RepeatStatus {
     pub repeat_count: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ErrorWindow {
+    pub stream: String,
+    pub line: usize,
+    pub before: Vec<String>,
+    pub matched: String,
+    pub after: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SummarySidecar {
     pub summary_schema_version: u32,
@@ -62,13 +76,35 @@ pub struct SummarySidecar {
     pub elapsed: String,
     pub elapsed_ms: u128,
     pub digest: String,
+    #[serde(default)]
+    pub exact_digest: String,
+    #[serde(default)]
+    pub normalized_digest: String,
     pub repeat_status: RepeatStatus,
     pub raw_stdout_lines: usize,
     pub raw_stderr_lines: usize,
     pub raw_total_lines: usize,
+    #[serde(default)]
+    pub raw_stdout_chars: usize,
+    #[serde(default)]
+    pub raw_stderr_chars: usize,
+    #[serde(default)]
+    pub raw_total_chars: usize,
     pub shown_lines: usize,
+    #[serde(default)]
+    pub shown_chars: usize,
     pub estimated_saved_lines: usize,
+    #[serde(default)]
+    pub estimated_saved_chars: usize,
     pub estimated_output_reduction_percent: f64,
+    #[serde(default)]
+    pub estimated_char_reduction_percent: f64,
+    #[serde(default)]
+    pub approx_raw_tokens: usize,
+    #[serde(default)]
+    pub approx_shown_tokens: usize,
+    #[serde(default)]
+    pub approx_saved_tokens: usize,
     pub error_count: usize,
     pub warning_count: usize,
     pub primary_failure: Option<String>,
@@ -77,10 +113,20 @@ pub struct SummarySidecar {
     pub file_hits: Vec<String>,
     pub tail: Vec<String>,
     pub suggested_next_reads: Vec<String>,
+    #[serde(default)]
+    pub error_windows: Vec<ErrorWindow>,
+    #[serde(default)]
+    pub digest_error_lines: Vec<String>,
+    #[serde(default)]
+    pub digest_file_hits: Vec<String>,
+    #[serde(default)]
+    pub test_or_package_hint: Option<String>,
     pub log_path: String,
     pub previous_exact_match_run: Option<PreviousExactMatchRun>,
     pub started_at: String,
     pub command_kind: String,
+    #[serde(default)]
+    pub summary_budget: String,
     #[serde(default = "default_capture_mode")]
     pub capture_mode: String,
     #[serde(default)]
@@ -110,10 +156,45 @@ pub struct Metrics {
     pub raw_line_count: u64,
     pub shown_line_count: u64,
     pub estimated_saved_lines: u64,
+    #[serde(default)]
+    pub raw_char_count: u64,
+    #[serde(default)]
+    pub shown_char_count: u64,
+    #[serde(default)]
+    pub estimated_saved_chars: u64,
+    #[serde(default)]
+    pub approx_raw_tokens: u64,
+    #[serde(default)]
+    pub approx_shown_tokens: u64,
+    #[serde(default)]
+    pub approx_saved_tokens: u64,
     pub failure_count: u64,
     pub repeated_failure_count: u64,
+    #[serde(default)]
+    pub repeated_failure_saved_lines: u64,
+    #[serde(default)]
+    pub repeated_failure_saved_chars: u64,
     pub last_command_time: Option<String>,
     pub per_command_kind: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub per_command_kind_stats: BTreeMap<String, CommandMetrics>,
+    #[serde(default)]
+    pub per_command: BTreeMap<String, CommandMetrics>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CommandMetrics {
+    pub count: u64,
+    pub raw_lines: u64,
+    pub shown_lines: u64,
+    pub saved_lines: u64,
+    pub raw_chars: u64,
+    pub shown_chars: u64,
+    pub saved_chars: u64,
+    pub failures: u64,
+    pub repeated_failures: u64,
+    #[serde(default)]
+    pub raw_line_samples: Vec<u64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -126,6 +207,42 @@ pub struct StateDiagnostics {
     pub metrics_valid: bool,
     pub digest_present: bool,
     pub digest_valid_json: bool,
+    pub digest_shards: usize,
+    pub latest_by_command_present: bool,
+    pub latest_by_command_valid: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LatestByCommandEntry {
+    pub run_id: String,
+    pub summary_path: String,
+    pub exit_code: i32,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct LogStats {
+    pub indexed_runs: usize,
+    pub raw_logs: usize,
+    pub summary_sidecars: usize,
+    pub temp_files: usize,
+    pub artifact_bytes: u64,
+    pub oldest_run: Option<String>,
+    pub newest_run: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct GcReport {
+    pub matched_artifacts: usize,
+    pub matched_bytes: u64,
+    pub deleted_artifacts: usize,
+    pub deleted_bytes: u64,
+}
+
+#[derive(Debug)]
+struct ArtifactInfo {
+    path: PathBuf,
+    modified: SystemTime,
+    bytes: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -151,6 +268,9 @@ impl Paths {
         Ok(Self {
             runs_index: state_dir.join("runs.jsonl"),
             digest_index: state_dir.join("digest-index.json"),
+            digest_dir: state_dir.join("digest"),
+            latest_by_command: state_dir.join("latest-by-command.json"),
+            temp_cleanup_marker: state_dir.join("last-temp-cleanup"),
             metrics: state_dir.join("metrics.json"),
             root,
             logs_dir,
@@ -162,6 +282,7 @@ impl Paths {
         create_private_dir_all(&self.root)?;
         create_private_dir_all(&self.logs_dir)?;
         create_private_dir_all(&self.state_dir)?;
+        create_private_dir_all(&self.digest_dir)?;
         Ok(())
     }
 
@@ -193,6 +314,32 @@ impl Paths {
         cleanup_stale_temp_files_in(&self.logs_dir, stale_after, &mut removed)?;
         Ok(removed)
     }
+
+    pub fn cleanup_stale_temp_files_amortized(
+        &self,
+        stale_after: Duration,
+        interval: Duration,
+    ) -> Result<Option<usize>> {
+        if !self.logs_dir.exists() || !cleanup_due(&self.temp_cleanup_marker, interval) {
+            return Ok(None);
+        }
+        let removed = self.cleanup_stale_temp_files(stale_after)?;
+        if let Some(parent) = self.temp_cleanup_marker.parent() {
+            create_private_dir_all(parent)?;
+        }
+        write_text_atomic(&self.temp_cleanup_marker, &iso_now())?;
+        Ok(Some(removed))
+    }
+}
+
+fn cleanup_due(marker: &Path, interval: Duration) -> bool {
+    marker
+        .metadata()
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .map(|age| age >= interval)
+        .unwrap_or(true)
 }
 
 fn default_capture_mode() -> String {
@@ -508,6 +655,14 @@ pub fn read_sidecar(path: &Path) -> Result<SummarySidecar> {
     serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))
 }
 
+pub fn read_sidecar_for_display(path: &Path) -> Result<SummarySidecar> {
+    let text = fs::read_to_string(path)
+        .context("KDS summary sidecar is missing or unreadable; the run may have been pruned")?;
+    serde_json::from_str(&text)
+        .context("KDS summary sidecar is invalid; the run metadata cannot be displayed safely")
+}
+
+#[cfg(test)]
 pub fn append_index(paths: &Paths, entry: &IndexEntry) -> Result<()> {
     with_state_lock(paths, || append_index_unlocked(paths, entry))
 }
@@ -571,6 +726,9 @@ pub fn state_diagnostics(paths: &Paths) -> StateDiagnostics {
     let (_, index) = read_index_with_diagnostics(paths);
     let (metrics_present, metrics_valid) = json_file_valid::<Metrics>(&paths.metrics);
     let (digest_present, digest_valid_json) = json_value_file_valid(&paths.digest_index);
+    let digest_shards = count_digest_shards(&paths.digest_dir);
+    let (latest_by_command_present, latest_by_command_valid) =
+        json_file_valid::<BTreeMap<String, LatestByCommandEntry>>(&paths.latest_by_command);
     StateDiagnostics {
         runs_index_present: index.present,
         runs_index_entries: index.entries,
@@ -578,8 +736,370 @@ pub fn state_diagnostics(paths: &Paths) -> StateDiagnostics {
         runs_index_read_errors: index.read_errors,
         metrics_present,
         metrics_valid,
-        digest_present,
-        digest_valid_json,
+        digest_present: digest_present || digest_shards > 0,
+        digest_valid_json: digest_valid_json || !digest_present,
+        digest_shards,
+        latest_by_command_present,
+        latest_by_command_valid,
+    }
+}
+
+fn count_digest_shards(path: &Path) -> usize {
+    if !path.exists() {
+        return 0;
+    }
+    let mut count = 0;
+    let Ok(first_level) = fs::read_dir(path) else {
+        return 0;
+    };
+    for entry in first_level.flatten() {
+        let child = entry.path();
+        if child.is_dir() {
+            if let Ok(files) = fs::read_dir(&child) {
+                count += files
+                    .flatten()
+                    .filter(|entry| {
+                        entry.path().extension().and_then(|ext| ext.to_str()) == Some("json")
+                    })
+                    .count();
+            }
+        }
+    }
+    count
+}
+
+pub fn log_stats(paths: &Paths) -> Result<LogStats> {
+    let entries = read_index(paths);
+    let mut stats = LogStats {
+        indexed_runs: entries.len(),
+        oldest_run: entries.first().map(|entry| entry.started_at.clone()),
+        newest_run: entries.last().map(|entry| entry.started_at.clone()),
+        ..LogStats::default()
+    };
+    if paths.logs_dir.exists() {
+        scan_log_stats(&paths.logs_dir, &mut stats)?;
+    }
+    Ok(stats)
+}
+
+fn scan_log_stats(path: &Path, stats: &mut LogStats) -> Result<()> {
+    for entry in fs::read_dir(path).with_context(|| format!("read {}", path.display()))? {
+        let entry = entry.with_context(|| format!("read {}", path.display()))?;
+        let child = entry.path();
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("stat {}", child.display()))?;
+        if file_type.is_dir() {
+            scan_log_stats(&child, stats)?;
+            continue;
+        }
+        if !file_type.is_file() {
+            continue;
+        }
+        let Some(kind) = kds_artifact_kind(&child) else {
+            continue;
+        };
+        stats.artifact_bytes += entry.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+        match kind {
+            ArtifactKind::RawLog => stats.raw_logs += 1,
+            ArtifactKind::SummarySidecar => stats.summary_sidecars += 1,
+            ArtifactKind::Temp => stats.temp_files += 1,
+        }
+    }
+    Ok(())
+}
+
+pub fn gc_artifacts(paths: &Paths, older_than: Duration, dry_run: bool) -> Result<GcReport> {
+    let mut report = GcReport::default();
+    if !paths.logs_dir.exists() {
+        return Ok(report);
+    }
+    let root = paths
+        .logs_dir
+        .canonicalize()
+        .with_context(|| format!("resolve {}", paths.logs_dir.display()))?;
+    gc_artifacts_in(&root, &root, older_than, dry_run, &mut report)?;
+    if !dry_run {
+        remove_empty_log_dirs(&root, &root)?;
+    }
+    Ok(report)
+}
+
+pub fn prune_to_max_artifact_bytes(
+    paths: &Paths,
+    max_bytes: u64,
+    dry_run: bool,
+) -> Result<GcReport> {
+    let mut report = GcReport::default();
+    if !paths.logs_dir.exists() {
+        return Ok(report);
+    }
+    let root = paths
+        .logs_dir
+        .canonicalize()
+        .with_context(|| format!("resolve {}", paths.logs_dir.display()))?;
+    let mut artifacts = Vec::new();
+    collect_artifacts(&root, &root, &mut artifacts)?;
+    let total: u64 = artifacts.iter().map(|artifact| artifact.bytes).sum();
+    if total <= max_bytes {
+        return Ok(report);
+    }
+    artifacts.sort_by_key(|artifact| artifact.modified);
+    let mut remaining = total;
+    for artifact in artifacts {
+        if remaining <= max_bytes {
+            break;
+        }
+        report.matched_artifacts += 1;
+        report.matched_bytes += artifact.bytes;
+        remaining = remaining.saturating_sub(artifact.bytes);
+        if !dry_run {
+            fs::remove_file(&artifact.path)
+                .with_context(|| format!("remove {}", artifact.path.display()))?;
+            report.deleted_artifacts += 1;
+            report.deleted_bytes += artifact.bytes;
+        }
+    }
+    if !dry_run {
+        remove_empty_log_dirs(&root, &root)?;
+    }
+    Ok(report)
+}
+
+pub fn compress_artifacts_older_than(paths: &Paths, older_than: Duration) -> Result<GcReport> {
+    let mut report = GcReport::default();
+    if !paths.logs_dir.exists() {
+        return Ok(report);
+    }
+    let root = paths
+        .logs_dir
+        .canonicalize()
+        .with_context(|| format!("resolve {}", paths.logs_dir.display()))?;
+    compress_artifacts_in(&root, &root, older_than, &mut report)?;
+    Ok(report)
+}
+
+fn compress_artifacts_in(
+    root: &Path,
+    path: &Path,
+    older_than: Duration,
+    report: &mut GcReport,
+) -> Result<()> {
+    for entry in fs::read_dir(path).with_context(|| format!("read {}", path.display()))? {
+        let entry = entry.with_context(|| format!("read {}", path.display()))?;
+        let child = entry.path();
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("stat {}", child.display()))?;
+        if file_type.is_dir() {
+            compress_artifacts_in(root, &child, older_than, report)?;
+            continue;
+        }
+        if !file_type.is_file() || child.extension().and_then(|ext| ext.to_str()) != Some("log") {
+            continue;
+        }
+        let metadata = entry
+            .metadata()
+            .with_context(|| format!("stat {}", child.display()))?;
+        let age = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| SystemTime::now().duration_since(modified).ok());
+        if age.is_none_or(|age| age < older_than) {
+            continue;
+        }
+        let canonical = child
+            .canonicalize()
+            .with_context(|| format!("resolve {}", child.display()))?;
+        if !canonical.starts_with(root) {
+            anyhow::bail!(
+                "refusing to compress artifact outside logs dir: {}",
+                child.display()
+            );
+        }
+        let gz_path = canonical.with_extension("log.gz");
+        if gz_path.exists() {
+            continue;
+        }
+        compress_file(&canonical, &gz_path)?;
+        fs::remove_file(&canonical).with_context(|| format!("remove {}", canonical.display()))?;
+        update_sidecar_log_path_after_compress(&canonical, &gz_path);
+        report.matched_artifacts += 1;
+        report.deleted_artifacts += 1;
+        report.matched_bytes += metadata.len();
+        report.deleted_bytes += metadata.len().saturating_sub(
+            gz_path
+                .metadata()
+                .map(|metadata| metadata.len())
+                .unwrap_or_default(),
+        );
+    }
+    Ok(())
+}
+
+fn compress_file(path: &Path, gz_path: &Path) -> Result<()> {
+    let mut input = fs::File::open(path).with_context(|| format!("read {}", path.display()))?;
+    let output = create_private_file_new(gz_path)
+        .with_context(|| format!("create {}", gz_path.display()))?;
+    let mut encoder = GzEncoder::new(output, Compression::default());
+    std::io::copy(&mut input, &mut encoder)
+        .with_context(|| format!("compress {}", path.display()))?;
+    let output = encoder.finish()?;
+    if durable_state_writes_enabled() {
+        output
+            .sync_all()
+            .with_context(|| format!("sync {}", gz_path.display()))?;
+    }
+    Ok(())
+}
+
+fn update_sidecar_log_path_after_compress(log_path: &Path, gz_path: &Path) {
+    let Some(file_name) = log_path.file_name().and_then(|name| name.to_str()) else {
+        return;
+    };
+    let Some(stem) = file_name.strip_suffix(".log") else {
+        return;
+    };
+    let sidecar_path = log_path.with_file_name(format!("{stem}.summary.json"));
+    let Ok(mut sidecar) = read_sidecar(&sidecar_path) else {
+        return;
+    };
+    sidecar.log_path = gz_path.display().to_string();
+    let _ = write_sidecar(&sidecar_path, &sidecar);
+}
+
+fn durable_state_writes_enabled() -> bool {
+    matches!(
+        std::env::var("KDS_DURABLE_LOGS")
+            .ok()
+            .as_deref()
+            .map(str::trim),
+        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
+    )
+}
+
+fn collect_artifacts(root: &Path, path: &Path, artifacts: &mut Vec<ArtifactInfo>) -> Result<()> {
+    for entry in fs::read_dir(path).with_context(|| format!("read {}", path.display()))? {
+        let entry = entry.with_context(|| format!("read {}", path.display()))?;
+        let child = entry.path();
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("stat {}", child.display()))?;
+        if file_type.is_dir() {
+            collect_artifacts(root, &child, artifacts)?;
+            continue;
+        }
+        if !file_type.is_file() || kds_artifact_kind(&child).is_none() {
+            continue;
+        }
+        let canonical = child
+            .canonicalize()
+            .with_context(|| format!("resolve {}", child.display()))?;
+        if !canonical.starts_with(root) {
+            anyhow::bail!(
+                "refusing to inspect artifact outside logs dir: {}",
+                child.display()
+            );
+        }
+        let metadata = entry
+            .metadata()
+            .with_context(|| format!("stat {}", child.display()))?;
+        artifacts.push(ArtifactInfo {
+            path: canonical,
+            modified: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+            bytes: metadata.len(),
+        });
+    }
+    Ok(())
+}
+
+fn gc_artifacts_in(
+    root: &Path,
+    path: &Path,
+    older_than: Duration,
+    dry_run: bool,
+    report: &mut GcReport,
+) -> Result<()> {
+    for entry in fs::read_dir(path).with_context(|| format!("read {}", path.display()))? {
+        let entry = entry.with_context(|| format!("read {}", path.display()))?;
+        let child = entry.path();
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("stat {}", child.display()))?;
+        if file_type.is_dir() {
+            gc_artifacts_in(root, &child, older_than, dry_run, report)?;
+            continue;
+        }
+        if !file_type.is_file() || kds_artifact_kind(&child).is_none() {
+            continue;
+        }
+        let metadata = entry
+            .metadata()
+            .with_context(|| format!("stat {}", child.display()))?;
+        let age = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| SystemTime::now().duration_since(modified).ok());
+        if age.is_none_or(|age| age < older_than) {
+            continue;
+        }
+        let canonical = child
+            .canonicalize()
+            .with_context(|| format!("resolve {}", child.display()))?;
+        if !canonical.starts_with(root) {
+            anyhow::bail!(
+                "refusing to remove artifact outside logs dir: {}",
+                child.display()
+            );
+        }
+        report.matched_artifacts += 1;
+        report.matched_bytes += metadata.len();
+        if !dry_run {
+            fs::remove_file(&canonical).with_context(|| format!("remove {}", child.display()))?;
+            report.deleted_artifacts += 1;
+            report.deleted_bytes += metadata.len();
+        }
+    }
+    Ok(())
+}
+
+fn remove_empty_log_dirs(root: &Path, path: &Path) -> Result<()> {
+    for entry in fs::read_dir(path).with_context(|| format!("read {}", path.display()))? {
+        let entry = entry.with_context(|| format!("read {}", path.display()))?;
+        let child = entry.path();
+        if entry
+            .file_type()
+            .with_context(|| format!("stat {}", child.display()))?
+            .is_dir()
+        {
+            remove_empty_log_dirs(root, &child)?;
+        }
+    }
+    if path != root && fs::read_dir(path)?.next().is_none() {
+        fs::remove_dir(path).with_context(|| format!("remove {}", path.display()))?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ArtifactKind {
+    RawLog,
+    SummarySidecar,
+    Temp,
+}
+
+fn kds_artifact_kind(path: &Path) -> Option<ArtifactKind> {
+    let file_name = path.file_name()?.to_str()?;
+    if file_name.ends_with(".summary.json") {
+        return Some(ArtifactKind::SummarySidecar);
+    }
+    if file_name.ends_with(".log.gz") {
+        return Some(ArtifactKind::RawLog);
+    }
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some("log") => Some(ArtifactKind::RawLog),
+        Some("tmp") => Some(ArtifactKind::Temp),
+        _ => None,
     }
 }
 
@@ -625,8 +1145,9 @@ fn run_hash(run_id: &str) -> Option<&str> {
 pub fn last_run(paths: &Paths) -> Result<IndexEntry> {
     read_index(paths)
         .into_iter()
-        .last()
-        .context("no KDS runs found")
+        .rev()
+        .find(|entry| read_sidecar(Path::new(&entry.summary_path)).is_ok())
+        .context("no readable KDS runs found")
 }
 
 pub fn previous_exact_match_with_sidecar(
@@ -634,21 +1155,76 @@ pub fn previous_exact_match_with_sidecar(
     argv: &[String],
     cwd: &str,
 ) -> Option<(PreviousExactMatchRun, Option<SummarySidecar>)> {
-    let entry = read_index(paths)
+    let mut fallback_without_sidecar = None;
+    let key = command_cache_key(argv, cwd);
+    if let Some(entry) = load_latest_by_command(paths).remove(&key) {
+        let sidecar = read_sidecar(Path::new(&entry.summary_path)).ok();
+        let previous = PreviousExactMatchRun {
+            run_id: entry.run_id,
+            exit_code: entry.exit_code,
+            digest: sidecar
+                .as_ref()
+                .map(|sidecar| sidecar.digest.clone())
+                .unwrap_or_default(),
+            summary_path: entry.summary_path,
+        };
+        if sidecar.is_some() {
+            return Some((previous, sidecar));
+        }
+        fallback_without_sidecar = Some((previous, None));
+    }
+
+    for entry in read_index(paths)
         .into_iter()
         .rev()
-        .find(|entry| entry.argv == argv && entry.cwd == cwd)?;
-    let sidecar = read_sidecar(Path::new(&entry.summary_path)).ok();
-    let previous = PreviousExactMatchRun {
+        .filter(|entry| entry.argv == argv && entry.cwd == cwd)
+    {
+        let sidecar = read_sidecar(Path::new(&entry.summary_path)).ok();
+        let previous = previous_match_from_entry(entry, sidecar.as_ref());
+        if sidecar.is_some() {
+            return Some((previous, sidecar));
+        }
+        if fallback_without_sidecar.is_none() {
+            fallback_without_sidecar = Some((previous, None));
+        }
+    }
+    fallback_without_sidecar
+}
+
+fn previous_match_from_entry(
+    entry: IndexEntry,
+    sidecar: Option<&SummarySidecar>,
+) -> PreviousExactMatchRun {
+    PreviousExactMatchRun {
         run_id: entry.run_id,
         exit_code: entry.exit_code,
         digest: sidecar
-            .as_ref()
             .map(|sidecar| sidecar.digest.clone())
             .unwrap_or_default(),
         summary_path: entry.summary_path,
-    };
-    Some((previous, sidecar))
+    }
+}
+
+pub fn command_cache_key(argv: &[String], cwd: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(command_identity(argv).as_bytes());
+    hasher.update(b"\0");
+    hasher.update(cwd.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn load_latest_by_command(paths: &Paths) -> BTreeMap<String, LatestByCommandEntry> {
+    fs::read_to_string(&paths.latest_by_command)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+fn write_latest_by_command(
+    paths: &Paths,
+    latest: &BTreeMap<String, LatestByCommandEntry>,
+) -> Result<()> {
+    write_json_atomic(&paths.latest_by_command, latest)
 }
 
 pub fn load_metrics(paths: &Paths) -> Metrics {
@@ -666,6 +1242,89 @@ pub fn write_metrics(paths: &Paths, metrics: &Metrics) -> Result<()> {
         create_private_dir_all(parent)?;
     }
     write_json_atomic(&paths.metrics, metrics)
+}
+
+pub fn record_run_state_unlocked(
+    paths: &Paths,
+    entry: &IndexEntry,
+    sidecar: &SummarySidecar,
+) -> Result<()> {
+    append_index_unlocked(paths, entry)?;
+    let mut latest = load_latest_by_command(paths);
+    latest.insert(
+        command_cache_key(&entry.argv, &entry.cwd),
+        LatestByCommandEntry {
+            run_id: entry.run_id.clone(),
+            summary_path: entry.summary_path.clone(),
+            exit_code: entry.exit_code,
+        },
+    );
+    write_latest_by_command(paths, &latest)?;
+
+    let mut metrics = load_metrics(paths);
+    update_metrics_for_sidecar(&mut metrics, sidecar);
+    write_metrics(paths, &metrics)
+}
+
+fn update_metrics_for_sidecar(metrics: &mut Metrics, sidecar: &SummarySidecar) {
+    metrics.metrics_schema_version = METRICS_SCHEMA_VERSION;
+    metrics.command_count += 1;
+    metrics.raw_line_count += sidecar.raw_total_lines as u64;
+    metrics.shown_line_count += sidecar.shown_lines as u64;
+    metrics.estimated_saved_lines += sidecar.estimated_saved_lines as u64;
+    metrics.raw_char_count += sidecar.raw_total_chars as u64;
+    metrics.shown_char_count += sidecar.shown_chars as u64;
+    metrics.estimated_saved_chars += sidecar.estimated_saved_chars as u64;
+    metrics.approx_raw_tokens += sidecar.approx_raw_tokens as u64;
+    metrics.approx_shown_tokens += sidecar.approx_shown_tokens as u64;
+    metrics.approx_saved_tokens += sidecar.approx_saved_tokens as u64;
+    if sidecar.exit_code != 0 {
+        metrics.failure_count += 1;
+    }
+    if sidecar.repeat_status.is_repeat {
+        metrics.repeated_failure_count += 1;
+        metrics.repeated_failure_saved_lines += sidecar.estimated_saved_lines as u64;
+        metrics.repeated_failure_saved_chars += sidecar.estimated_saved_chars as u64;
+    }
+    metrics.last_command_time = Some(sidecar.started_at.clone());
+    *metrics
+        .per_command_kind
+        .entry(sidecar.command_kind.clone())
+        .or_insert(0) += 1;
+    update_command_metrics(
+        metrics
+            .per_command_kind_stats
+            .entry(sidecar.command_kind.clone())
+            .or_default(),
+        sidecar,
+    );
+    update_command_metrics(
+        metrics
+            .per_command
+            .entry(sidecar.command.clone())
+            .or_default(),
+        sidecar,
+    );
+}
+
+fn update_command_metrics(metric: &mut CommandMetrics, sidecar: &SummarySidecar) {
+    metric.count += 1;
+    metric.raw_lines += sidecar.raw_total_lines as u64;
+    metric.shown_lines += sidecar.shown_lines as u64;
+    metric.saved_lines += sidecar.estimated_saved_lines as u64;
+    metric.raw_chars += sidecar.raw_total_chars as u64;
+    metric.shown_chars += sidecar.shown_chars as u64;
+    metric.saved_chars += sidecar.estimated_saved_chars as u64;
+    if sidecar.exit_code != 0 {
+        metric.failures += 1;
+    }
+    if sidecar.repeat_status.is_repeat {
+        metric.repeated_failures += 1;
+    }
+    metric.raw_line_samples.push(sidecar.raw_total_lines as u64);
+    if metric.raw_line_samples.len() > 200 {
+        metric.raw_line_samples.remove(0);
+    }
 }
 
 pub fn with_state_lock<T>(paths: &Paths, action: impl FnOnce() -> Result<T>) -> Result<T> {
@@ -996,6 +1655,67 @@ mod tests {
     }
 
     #[test]
+    fn previous_exact_match_skips_stale_latest_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(dir.path());
+        paths.ensure_runtime_dirs().unwrap();
+        let day = paths.logs_dir.join("2026-01-01");
+        fs::create_dir_all(&day).unwrap();
+        let argv = vec!["cargo".to_string(), "test".to_string()];
+        let cwd = "C:/repo";
+        let old_summary = day.join("old.summary.json");
+        let missing_summary = day.join("missing.summary.json");
+        write_sidecar(&old_summary, &test_sidecar("old-run", "old-digest")).unwrap();
+
+        let old_entry = test_index_entry("old-run", &old_summary, &argv, cwd, 1);
+        let stale_entry = test_index_entry("stale-run", &missing_summary, &argv, cwd, 1);
+        append_index(&paths, &old_entry).unwrap();
+        append_index(&paths, &stale_entry).unwrap();
+
+        let mut latest = BTreeMap::new();
+        latest.insert(
+            command_cache_key(&argv, cwd),
+            LatestByCommandEntry {
+                run_id: "stale-run".into(),
+                summary_path: missing_summary.display().to_string(),
+                exit_code: 1,
+            },
+        );
+        write_latest_by_command(&paths, &latest).unwrap();
+
+        let (previous, sidecar) = previous_exact_match_with_sidecar(&paths, &argv, cwd).unwrap();
+        assert_eq!(previous.run_id, "old-run");
+        assert_eq!(previous.digest, "old-digest");
+        assert_eq!(sidecar.unwrap().digest, "old-digest");
+    }
+
+    #[test]
+    fn last_run_skips_entries_without_readable_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(dir.path());
+        paths.ensure_runtime_dirs().unwrap();
+        let day = paths.logs_dir.join("2026-01-01");
+        fs::create_dir_all(&day).unwrap();
+        let argv = vec!["cargo".to_string(), "test".to_string()];
+        let old_summary = day.join("old.summary.json");
+        let missing_summary = day.join("missing.summary.json");
+        write_sidecar(&old_summary, &test_sidecar("old-run", "old-digest")).unwrap();
+
+        append_index(
+            &paths,
+            &test_index_entry("old-run", &old_summary, &argv, "C:/repo", 1),
+        )
+        .unwrap();
+        append_index(
+            &paths,
+            &test_index_entry("stale-run", &missing_summary, &argv, "C:/repo", 1),
+        )
+        .unwrap();
+
+        assert_eq!(last_run(&paths).unwrap().run_id, "old-run");
+    }
+
+    #[test]
     fn invalid_metrics_and_digest_state_are_reported() {
         let dir = tempfile::tempdir().unwrap();
         std::env::set_var("KDS_HOME", dir.path());
@@ -1083,5 +1803,124 @@ mod tests {
         let bytes = fs::read(path).unwrap();
         assert!(bytes.windows(3).any(|window| window == [0xff, 0x00, b'a']));
         assert!(bytes.windows(2).any(|window| window == [0xfe, b'b']));
+    }
+
+    #[test]
+    fn compress_artifacts_gzips_old_raw_logs() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(dir.path());
+        paths.ensure_runtime_dirs().unwrap();
+        let day = paths.logs_dir.join("2026-01-01");
+        fs::create_dir_all(&day).unwrap();
+        let log = day.join("old.log");
+        let gz = day.join("old.log.gz");
+        fs::write(&log, "old log\n").unwrap();
+
+        let report = compress_artifacts_older_than(&paths, Duration::ZERO).unwrap();
+
+        assert_eq!(report.deleted_artifacts, 1);
+        assert!(!log.exists());
+        assert!(gz.exists());
+        let bytes = fs::read(gz).unwrap();
+        assert_eq!(&bytes[..2], &[0x1f, 0x8b]);
+    }
+
+    fn test_paths(root: &Path) -> Paths {
+        let logs_dir = root.join("logs");
+        let state_dir = root.join("state");
+        Paths {
+            root: root.to_path_buf(),
+            logs_dir,
+            runs_index: state_dir.join("runs.jsonl"),
+            digest_index: state_dir.join("digest-index.json"),
+            digest_dir: state_dir.join("digest"),
+            latest_by_command: state_dir.join("latest-by-command.json"),
+            temp_cleanup_marker: state_dir.join("last-temp-cleanup"),
+            metrics: state_dir.join("metrics.json"),
+            state_dir,
+        }
+    }
+
+    fn test_index_entry(
+        run_id: &str,
+        summary_path: &Path,
+        argv: &[String],
+        cwd: &str,
+        exit_code: i32,
+    ) -> IndexEntry {
+        IndexEntry {
+            index_schema_version: INDEX_SCHEMA_VERSION,
+            run_id: run_id.into(),
+            summary_path: summary_path.display().to_string(),
+            exit_code,
+            command_kind: "cargo".into(),
+            command: command_string(argv),
+            argv: argv.to_vec(),
+            cwd: cwd.into(),
+            started_at: iso_now(),
+            log_path: summary_path.with_extension("log").display().to_string(),
+        }
+    }
+
+    fn test_sidecar(run_id: &str, digest: &str) -> SummarySidecar {
+        SummarySidecar {
+            summary_schema_version: SUMMARY_SCHEMA_VERSION,
+            kds_version: "test".into(),
+            run_id: run_id.into(),
+            summary_path: "old.summary.json".into(),
+            command: "cargo test".into(),
+            argv: vec!["cargo".into(), "test".into()],
+            cwd: "C:/repo".into(),
+            mode: "compact".into(),
+            exit_code: 1,
+            elapsed: "1ms".into(),
+            elapsed_ms: 1,
+            digest: digest.into(),
+            exact_digest: digest.into(),
+            normalized_digest: digest.into(),
+            repeat_status: RepeatStatus {
+                is_repeat: false,
+                message: "new failure signal".into(),
+                first_seen: None,
+                previous_log_path: None,
+                current_log_path: "old.log".into(),
+                repeat_count: 0,
+            },
+            raw_stdout_lines: 0,
+            raw_stderr_lines: 1,
+            raw_total_lines: 1,
+            raw_stdout_chars: 0,
+            raw_stderr_chars: 12,
+            raw_total_chars: 12,
+            shown_lines: 1,
+            shown_chars: 12,
+            estimated_saved_lines: 0,
+            estimated_saved_chars: 0,
+            estimated_output_reduction_percent: 0.0,
+            estimated_char_reduction_percent: 0.0,
+            approx_raw_tokens: 3,
+            approx_shown_tokens: 3,
+            approx_saved_tokens: 0,
+            error_count: 1,
+            warning_count: 0,
+            primary_failure: Some("error: old".into()),
+            delta: None,
+            top_errors: vec!["error: old".into()],
+            file_hits: Vec::new(),
+            tail: vec!["error: old".into()],
+            suggested_next_reads: Vec::new(),
+            error_windows: Vec::new(),
+            digest_error_lines: vec!["error: old".into()],
+            digest_file_hits: Vec::new(),
+            test_or_package_hint: None,
+            log_path: "old.log".into(),
+            previous_exact_match_run: None,
+            started_at: iso_now(),
+            command_kind: "cargo".into(),
+            summary_budget: "normal".into(),
+            capture_mode: "test".into(),
+            spawn_error: None,
+            runtime_warnings: Vec::new(),
+        }
     }
 }

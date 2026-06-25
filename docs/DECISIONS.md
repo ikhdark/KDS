@@ -9,7 +9,8 @@
   explicit development/manual helper, not a product-style activated install.
 - KDS must stay original and must not depend on, copy, or vendor another command
   wrapping tool.
-- V1 saves full raw logs locally and never truncates saved logs.
+- V1 saves full raw logs locally by default. `KDS_MAX_RAW_BYTES` may cap
+  persisted raw bytes per stream, but KDS must keep draining child output.
 - V1 does not provide stored raw-log dumping.
 - First response must stay compact.
 - Success path compression is required for exit code `0`.

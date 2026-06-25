@@ -18,6 +18,10 @@ enum Command {
     Raw(WrappedCommand),
     /// Show estimated output reduction metrics.
     Gain,
+    /// Remove old local KDS run artifacts.
+    Gc(GcArgs),
+    /// Prune old local KDS run artifacts.
+    Prune(PruneArgs),
     /// Run read-only health checks.
     Doctor,
     /// Inspect stored log metadata and safe sections.
@@ -34,8 +38,17 @@ enum Command {
 pub struct WrappedCommand {
     #[arg(long)]
     pub show_paths: bool,
+    #[arg(long, value_enum)]
+    pub budget: Option<SummaryBudget>,
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub command: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum SummaryBudget {
+    Tight,
+    Normal,
+    Wide,
 }
 
 #[derive(Debug, Args)]
@@ -48,6 +61,8 @@ pub struct LogsArgs {
 pub enum LogsCommand {
     /// Print the KDS log directory.
     Dir,
+    /// Print safe local log storage statistics.
+    Stats,
     /// Print safe metadata for the most recent run.
     Last(LogsDisplayArgs),
     /// Show safe metadata or one requested section for a run.
@@ -69,10 +84,32 @@ pub struct LogsShowArgs {
     pub summary: bool,
     #[arg(long)]
     pub errors: bool,
+    #[arg(long = "error-window")]
+    pub error_window: bool,
     #[arg(long)]
     pub tail: bool,
     #[arg(long = "file-hits")]
     pub file_hits: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct GcArgs {
+    /// Remove artifacts older than this age, such as 30d, 12h, or 90m.
+    #[arg(long = "older-than")]
+    pub older_than: String,
+    /// Report what would be deleted without removing files.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct PruneArgs {
+    /// Remove artifacts older than this age, such as 30d, 12h, or 90m.
+    #[arg(long = "before")]
+    pub before: String,
+    /// Report what would be deleted without removing files.
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Args)]
@@ -131,18 +168,27 @@ pub fn run() -> Result<i32> {
             raw_args.into_iter().skip(1).collect(),
             crate::runner::Mode::Compact,
             false,
+            None,
         );
     }
 
     let cli = Cli::parse();
     match cli.command {
-        Some(Command::Run(args)) => {
-            crate::runner::run(args.command, crate::runner::Mode::Compact, args.show_paths)
-        }
-        Some(Command::Raw(args)) => {
-            crate::runner::run(args.command, crate::runner::Mode::Raw, args.show_paths)
-        }
+        Some(Command::Run(args)) => crate::runner::run(
+            args.command,
+            crate::runner::Mode::Compact,
+            args.show_paths,
+            args.budget,
+        ),
+        Some(Command::Raw(args)) => crate::runner::run(
+            args.command,
+            crate::runner::Mode::Raw,
+            args.show_paths,
+            args.budget,
+        ),
         Some(Command::Gain) => crate::gain::run(),
+        Some(Command::Gc(args)) => crate::gc::run(args),
+        Some(Command::Prune(args)) => crate::gc::run_prune(args),
         Some(Command::Doctor) => crate::doctor::run(),
         Some(Command::Logs(args)) => crate::logs::run(args.command),
         Some(Command::Evidence(args)) => crate::evidence::run(args.id, args.show_paths),

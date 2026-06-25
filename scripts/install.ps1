@@ -246,7 +246,7 @@ if ($kdsDir -and -not (($env:PATH -split ';') -contains $kdsDir)) {
   $env:PATH = "$kdsDir;$env:PATH"
 }
 
-$updatedCommand = "kds.exe -- $trimmed"
+$updatedCommand = "KDS -- $trimmed"
 
 $response = [ordered]@{
   hookSpecificOutput = [ordered]@{

@@ -31,6 +31,11 @@ After copying the binary, the installer validates that `kds.exe` exists, that
 was requested, whether detected Codex Desktop hook files were updated, and
 whether the install directory is visible on the user PATH.
 
+After install, run `kds doctor` to check the local runtime state, PowerShell
+hook status, Codex Desktop hook install status, Codex Desktop hook trust state,
+Desktop hook script validity, and whether the Desktop `hooks.json` file is
+parseable.
+
 Dry-run:
 
 ```powershell

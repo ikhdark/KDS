@@ -4,14 +4,15 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{mpsc, Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::cli::SummaryBudget;
 use crate::digest;
 use crate::storage::{
-    self, IndexEntry, Paths, RunPaths, SummarySidecar, INDEX_SCHEMA_VERSION,
-    METRICS_SCHEMA_VERSION, SUMMARY_SCHEMA_VERSION,
+    self, IndexEntry, Paths, RepeatStatus, RunPaths, SummarySidecar, INDEX_SCHEMA_VERSION,
+    SUMMARY_SCHEMA_VERSION,
 };
 use crate::summarize;
 
@@ -30,7 +31,12 @@ impl Mode {
     }
 }
 
-pub fn run(argv: Vec<String>, mode: Mode, show_paths: bool) -> Result<i32> {
+pub fn run(
+    argv: Vec<String>,
+    mode: Mode,
+    show_paths: bool,
+    budget: Option<SummaryBudget>,
+) -> Result<i32> {
     if argv.is_empty() {
         eprintln!("kds: no wrapped command provided");
         return Ok(2);
@@ -49,6 +55,7 @@ pub fn run(argv: Vec<String>, mode: Mode, show_paths: bool) -> Result<i32> {
     let paths = Paths::discover()?;
     let run_paths = paths.prepare_run_paths(&safe_argv, &cwd, started)?;
     cleanup_stale_temps(&paths);
+    apply_retention_controls(&paths);
     let command_kind = storage::command_kind(&argv);
     let program = storage::resolve_command(&argv[0]);
     let raw_byte_limit = raw_byte_limit();
@@ -83,11 +90,13 @@ pub fn run(argv: Vec<String>, mode: Mode, show_paths: bool) -> Result<i32> {
                 started,
                 elapsed_duration: begin.elapsed(),
                 failure: &failure,
+                budget,
             });
             return Ok(1);
         }
     };
     let child_guard = track_child(child.id());
+    let progress_notice = ProgressNotice::start(mode, begin);
 
     let stdout = child
         .stdout
@@ -97,13 +106,32 @@ pub fn run(argv: Vec<String>, mode: Mode, show_paths: bool) -> Result<i32> {
         .stderr
         .take()
         .expect("child stderr was piped but unavailable");
-    let stdout_reader = spawn_pipe_copy(stdout, stdout_temp_file, raw_byte_limit);
-    let stderr_reader = spawn_pipe_copy(stderr, stderr_temp_file, raw_byte_limit);
+    let live_tee = mode == Mode::Raw;
+    let stdout_reader = spawn_pipe_copy(
+        stdout,
+        stdout_temp_file,
+        raw_byte_limit,
+        "stdout",
+        if live_tee {
+            Some(StreamTee::Stdout)
+        } else {
+            None
+        },
+    );
+    let stderr_reader = spawn_pipe_copy(
+        stderr,
+        stderr_temp_file,
+        raw_byte_limit,
+        "stderr",
+        if live_tee {
+            Some(StreamTee::Stderr)
+        } else {
+            None
+        },
+    );
 
-    let status = match child.wait() {
-        Ok(status) => status,
-        Err(err) => return Err(err.into()),
-    };
+    let status = child.wait()?;
+    drop(progress_notice);
     let stdout_capture = join_pipe_copy("stdout", stdout_reader).unwrap_or_else(|err| {
         eprintln!("kds: stdout capture failed: {err:#}");
         PipeCapture::default()
@@ -131,34 +159,42 @@ pub fn run(argv: Vec<String>, mode: Mode, show_paths: bool) -> Result<i32> {
         }
     };
 
-    if mode == Mode::Raw {
-        if let Err(err) = copy_file_to_stdout(&stdout_temp_path) {
-            eprintln!("kds: raw stdout replay failed: {err:#}");
-        }
-        if let Err(err) = copy_file_to_stderr(&stderr_temp_path) {
-            eprintln!("kds: raw stderr replay failed: {err:#}");
-        }
-        if stdout_capture.discarded_bytes > 0 || stderr_capture.discarded_bytes > 0 {
-            eprintln!(
-                "kds: raw output replay was truncated by KDS_MAX_RAW_BYTES; see raw log note"
-            );
-        }
+    if mode == Mode::Raw
+        && (stdout_capture.discarded_bytes > 0 || stderr_capture.discarded_bytes > 0)
+    {
+        eprintln!(
+            "kds: persisted raw log was truncated by KDS_MAX_RAW_BYTES; live raw output was still teed"
+        );
     }
 
-    let extracted_output =
-        summarize::extract_from_paths(&stdout_temp_path, &stderr_temp_path, exit_code)?;
+    let extracted_output = summarize::merge_stream_summaries(
+        stdout_capture.summary,
+        stderr_capture.summary,
+        exit_code,
+    );
     let raw_stdout_lines = extracted_output.stdout_lines;
     let raw_stderr_lines = extracted_output.stderr_lines;
     let raw_total_lines = raw_stdout_lines + raw_stderr_lines;
+    let raw_stdout_chars = extracted_output.stdout_chars;
+    let raw_stderr_chars = extracted_output.stderr_chars;
+    let raw_total_chars = raw_stdout_chars + raw_stderr_chars;
     let extracted = extracted_output.summary;
     let cwd_string = cwd.display().to_string();
-    let digest = digest::make_digest(
+    let exact_digest = digest::make_exact_digest(
         &command_kind,
         &safe_command_identity,
         &cwd_string,
         exit_code,
         &extracted,
     );
+    let normalized_digest = digest::make_normalized_digest(
+        &command_kind,
+        &safe_command_identity,
+        &cwd_string,
+        exit_code,
+        &extracted,
+    );
+    let digest = normalized_digest.clone();
     let (previous_match, previous_sidecar) =
         match storage::previous_exact_match_with_sidecar(&paths, &safe_argv, &cwd_string) {
             Some((previous_match, previous_sidecar)) => (Some(previous_match), previous_sidecar),
@@ -189,30 +225,7 @@ pub fn run(argv: Vec<String>, mode: Mode, show_paths: bool) -> Result<i32> {
         record_runtime_warning(&mut runtime_warnings, "raw log write failed", &err);
     }
 
-    let repeat_status = match digest::update_repeat_state(
-        &paths,
-        &digest,
-        &safe_command_identity,
-        &cwd_string,
-        exit_code,
-        &run_paths.log_path,
-        &run_paths.run_id,
-    ) {
-        Ok(status) => status,
-        Err(err) => {
-            eprintln!("kds: digest state write failed: {err:#}");
-            storage::RepeatStatus {
-                is_repeat: false,
-                message: "digest state unavailable".to_string(),
-                first_seen: None,
-                previous_log_path: None,
-                current_log_path: run_paths.log_path.display().to_string(),
-                repeat_count: 0,
-            }
-        }
-    };
-
-    let mut sidecar = SummarySidecar {
+    let sidecar = SummarySidecar {
         summary_schema_version: SUMMARY_SCHEMA_VERSION,
         kds_version: env!("CARGO_PKG_VERSION").to_string(),
         run_id: run_paths.run_id.clone(),
@@ -225,13 +238,24 @@ pub fn run(argv: Vec<String>, mode: Mode, show_paths: bool) -> Result<i32> {
         elapsed: elapsed.clone(),
         elapsed_ms: elapsed_duration.as_millis(),
         digest: digest.clone(),
-        repeat_status,
+        exact_digest,
+        normalized_digest,
+        repeat_status: placeholder_repeat_status(&run_paths),
         raw_stdout_lines,
         raw_stderr_lines,
         raw_total_lines,
+        raw_stdout_chars,
+        raw_stderr_chars,
+        raw_total_chars,
         shown_lines: 0,
+        shown_chars: 0,
         estimated_saved_lines: 0,
+        estimated_saved_chars: 0,
         estimated_output_reduction_percent: 0.0,
+        estimated_char_reduction_percent: 0.0,
+        approx_raw_tokens: approximate_tokens(raw_total_chars),
+        approx_shown_tokens: 0,
+        approx_saved_tokens: 0,
         error_count: extracted.error_count,
         warning_count: extracted.warning_count,
         primary_failure: extracted.primary_failure,
@@ -240,25 +264,19 @@ pub fn run(argv: Vec<String>, mode: Mode, show_paths: bool) -> Result<i32> {
         file_hits: extracted.file_hits,
         tail: extracted.tail,
         suggested_next_reads: extracted.suggested_next_reads,
+        error_windows: extracted.error_windows,
+        digest_error_lines: extracted.digest_error_lines,
+        digest_file_hits: extracted.digest_file_hits,
+        test_or_package_hint: extracted.test_or_package_hint,
         log_path: run_paths.log_path.display().to_string(),
         previous_exact_match_run: previous_match,
         started_at: started.to_rfc3339(),
         command_kind: command_kind.clone(),
+        summary_budget: budget_label(budget).to_string(),
         capture_mode: "stdout/stderr piped to local temp files".to_string(),
         spawn_error: None,
         runtime_warnings,
     };
-
-    let display_once = summarize::format_compact_with_paths(&sidecar, show_paths);
-    sidecar.shown_lines = storage::line_count(&display_once);
-    sidecar.estimated_saved_lines = raw_total_lines.saturating_sub(sidecar.shown_lines);
-    sidecar.estimated_output_reduction_percent =
-        storage::display_percent(sidecar.estimated_saved_lines, raw_total_lines);
-    let display = summarize::format_compact_with_paths(&sidecar, show_paths);
-
-    if mode == Mode::Compact {
-        print!("{display}");
-    }
 
     let entry = IndexEntry {
         index_schema_version: INDEX_SCHEMA_VERSION,
@@ -268,20 +286,48 @@ pub fn run(argv: Vec<String>, mode: Mode, show_paths: bool) -> Result<i32> {
         command_kind,
         command: safe_command,
         argv: safe_argv,
-        cwd: cwd_string,
+        cwd: cwd_string.clone(),
         started_at: sidecar.started_at.clone(),
         log_path: run_paths.log_path.display().to_string(),
     };
-    write_sidecar_index_metrics(&paths, &run_paths, &sidecar, &entry);
+    let (_sidecar, display) = commit_run_state(CommitRunState {
+        paths: &paths,
+        run_paths: &run_paths,
+        sidecar,
+        entry: &entry,
+        digest: &digest,
+        command_identity: &safe_command_identity,
+        cwd: &cwd_string,
+        show_paths,
+        budget,
+    });
+
+    if mode == Mode::Compact {
+        print!("{display}");
+    }
 
     Ok(exit_code)
 }
 
 fn should_passthrough(argv: &[String]) -> bool {
-    git_subcommand(argv).is_some_and(|command| command == "diff")
+    let Some(command) = git_subcommand(argv) else {
+        return false;
+    };
+    match command.name.to_ascii_lowercase().as_str() {
+        "diff" | "status" | "rev-parse" | "hash-object" => true,
+        "log" => command.args.iter().any(|arg| {
+            *arg == "--oneline" || *arg == "--format=oneline" || *arg == "--pretty=oneline"
+        }),
+        _ => false,
+    }
 }
 
-fn git_subcommand(argv: &[String]) -> Option<&str> {
+struct GitSubcommand<'a> {
+    name: &'a str,
+    args: Vec<&'a str>,
+}
+
+fn git_subcommand(argv: &[String]) -> Option<GitSubcommand<'_>> {
     let command = argv.first()?;
     let stem = std::path::Path::new(command).file_stem()?.to_str()?;
     if !stem.eq_ignore_ascii_case("git") {
@@ -332,7 +378,10 @@ fn git_subcommand(argv: &[String]) -> Option<&str> {
         if arg.starts_with('-') {
             continue;
         }
-        return Some(arg);
+        return Some(GitSubcommand {
+            name: arg,
+            args: args.collect(),
+        });
     }
 
     None
@@ -355,29 +404,6 @@ fn passthrough(argv: &[String]) -> Result<i32> {
     Ok(status.code().unwrap_or(1))
 }
 
-fn update_metrics(paths: &Paths, sidecar: &SummarySidecar) -> Result<()> {
-    storage::with_state_lock(paths, || {
-        let mut metrics = storage::load_metrics(paths);
-        metrics.metrics_schema_version = METRICS_SCHEMA_VERSION;
-        metrics.command_count += 1;
-        metrics.raw_line_count += sidecar.raw_total_lines as u64;
-        metrics.shown_line_count += sidecar.shown_lines as u64;
-        metrics.estimated_saved_lines += sidecar.estimated_saved_lines as u64;
-        if sidecar.exit_code != 0 {
-            metrics.failure_count += 1;
-        }
-        if sidecar.repeat_status.is_repeat {
-            metrics.repeated_failure_count += 1;
-        }
-        metrics.last_command_time = Some(sidecar.started_at.clone());
-        *metrics
-            .per_command_kind
-            .entry(sidecar.command_kind.clone())
-            .or_insert(0) += 1;
-        storage::write_metrics(paths, &metrics)
-    })
-}
-
 struct SpawnFailureRecord<'a> {
     paths: &'a Paths,
     run_paths: &'a RunPaths,
@@ -390,6 +416,7 @@ struct SpawnFailureRecord<'a> {
     started: chrono::DateTime<Local>,
     elapsed_duration: Duration,
     failure: &'a str,
+    budget: Option<SummaryBudget>,
 }
 
 fn record_spawn_failure(record: SpawnFailureRecord<'_>) {
@@ -398,35 +425,21 @@ fn record_spawn_failure(record: SpawnFailureRecord<'_>) {
     let failure = summarize::redact_sensitive_text(record.failure);
     let extracted = summarize::extract("", &failure, exit_code);
     let cwd_string = record.cwd.display().to_string();
-    let digest = digest::make_digest(
+    let exact_digest = digest::make_exact_digest(
         record.command_kind,
         record.safe_command_identity,
         &cwd_string,
         exit_code,
         &extracted,
     );
-    let repeat_status = match digest::update_repeat_state(
-        record.paths,
-        &digest,
+    let normalized_digest = digest::make_normalized_digest(
+        record.command_kind,
         record.safe_command_identity,
         &cwd_string,
         exit_code,
-        &record.run_paths.log_path,
-        &record.run_paths.run_id,
-    ) {
-        Ok(status) => status,
-        Err(err) => {
-            eprintln!("kds: digest state write failed: {err:#}");
-            storage::RepeatStatus {
-                is_repeat: false,
-                message: "digest state unavailable".to_string(),
-                first_seen: None,
-                previous_log_path: None,
-                current_log_path: record.run_paths.log_path.display().to_string(),
-                repeat_count: 0,
-            }
-        }
-    };
+        &extracted,
+    );
+    let digest = normalized_digest.clone();
 
     let mut runtime_warnings = Vec::new();
     if let Err(err) = storage::write_raw_log(storage::RawLog {
@@ -442,7 +455,7 @@ fn record_spawn_failure(record: SpawnFailureRecord<'_>) {
         record_runtime_warning(&mut runtime_warnings, "raw log write failed", &err);
     }
 
-    let mut sidecar = SummarySidecar {
+    let sidecar = SummarySidecar {
         summary_schema_version: SUMMARY_SCHEMA_VERSION,
         kds_version: env!("CARGO_PKG_VERSION").to_string(),
         run_id: record.run_paths.run_id.clone(),
@@ -455,13 +468,24 @@ fn record_spawn_failure(record: SpawnFailureRecord<'_>) {
         elapsed: elapsed.clone(),
         elapsed_ms: record.elapsed_duration.as_millis(),
         digest: digest.clone(),
-        repeat_status,
+        exact_digest,
+        normalized_digest,
+        repeat_status: placeholder_repeat_status(record.run_paths),
         raw_stdout_lines: 0,
         raw_stderr_lines: storage::line_count(&failure),
         raw_total_lines: storage::line_count(&failure),
+        raw_stdout_chars: 0,
+        raw_stderr_chars: failure.chars().count(),
+        raw_total_chars: failure.chars().count(),
         shown_lines: 0,
+        shown_chars: 0,
         estimated_saved_lines: 0,
+        estimated_saved_chars: 0,
         estimated_output_reduction_percent: 0.0,
+        estimated_char_reduction_percent: 0.0,
+        approx_raw_tokens: approximate_tokens(failure.chars().count()),
+        approx_shown_tokens: 0,
+        approx_saved_tokens: 0,
         error_count: extracted.error_count,
         warning_count: extracted.warning_count,
         primary_failure: extracted.primary_failure,
@@ -470,23 +494,19 @@ fn record_spawn_failure(record: SpawnFailureRecord<'_>) {
         file_hits: extracted.file_hits,
         tail: extracted.tail,
         suggested_next_reads: extracted.suggested_next_reads,
+        error_windows: extracted.error_windows,
+        digest_error_lines: extracted.digest_error_lines,
+        digest_file_hits: extracted.digest_file_hits,
+        test_or_package_hint: extracted.test_or_package_hint,
         log_path: record.run_paths.log_path.display().to_string(),
         previous_exact_match_run: None,
         started_at: record.started.to_rfc3339(),
         command_kind: record.command_kind.to_string(),
+        summary_budget: budget_label(record.budget).to_string(),
         capture_mode: "not started; spawn failed".to_string(),
         spawn_error: Some(failure),
         runtime_warnings,
     };
-
-    let display_once = summarize::format_compact_with_paths(&sidecar, false);
-    sidecar.shown_lines = storage::line_count(&display_once);
-    sidecar.estimated_saved_lines = sidecar.raw_total_lines.saturating_sub(sidecar.shown_lines);
-    sidecar.estimated_output_reduction_percent =
-        storage::display_percent(sidecar.estimated_saved_lines, sidecar.raw_total_lines);
-    if record.mode == Mode::Compact {
-        print!("{}", summarize::format_compact_with_paths(&sidecar, false));
-    }
 
     let entry = IndexEntry {
         index_schema_version: INDEX_SCHEMA_VERSION,
@@ -496,27 +516,116 @@ fn record_spawn_failure(record: SpawnFailureRecord<'_>) {
         command_kind: record.command_kind.to_string(),
         command: record.command.to_string(),
         argv: record.safe_argv.to_vec(),
-        cwd: cwd_string,
+        cwd: cwd_string.clone(),
         started_at: sidecar.started_at.clone(),
         log_path: record.run_paths.log_path.display().to_string(),
     };
-    write_sidecar_index_metrics(record.paths, record.run_paths, &sidecar, &entry);
+    let (_sidecar, display) = commit_run_state(CommitRunState {
+        paths: record.paths,
+        run_paths: record.run_paths,
+        sidecar,
+        entry: &entry,
+        digest: &digest,
+        command_identity: record.safe_command_identity,
+        cwd: &cwd_string,
+        show_paths: false,
+        budget: record.budget,
+    });
+    if record.mode == Mode::Compact {
+        print!("{display}");
+    }
 }
 
-fn write_sidecar_index_metrics(
-    paths: &Paths,
-    run_paths: &RunPaths,
-    sidecar: &SummarySidecar,
-    entry: &IndexEntry,
-) {
-    if let Err(err) = storage::write_sidecar(&run_paths.summary_path, sidecar) {
-        eprintln!("kds: sidecar write failed: {err:#}; wrapped exit code preserved");
+struct CommitRunState<'a> {
+    paths: &'a Paths,
+    run_paths: &'a RunPaths,
+    sidecar: SummarySidecar,
+    entry: &'a IndexEntry,
+    digest: &'a str,
+    command_identity: &'a str,
+    cwd: &'a str,
+    show_paths: bool,
+    budget: Option<SummaryBudget>,
+}
+
+fn commit_run_state(commit: CommitRunState<'_>) -> (SummarySidecar, String) {
+    let CommitRunState {
+        paths,
+        run_paths,
+        mut sidecar,
+        entry,
+        digest,
+        command_identity,
+        cwd,
+        show_paths,
+        budget,
+    } = commit;
+    let mut display = String::new();
+    if let Err(err) = storage::with_state_lock(paths, || {
+        sidecar.repeat_status = digest::update_repeat_state_unlocked(
+            paths,
+            digest,
+            command_identity,
+            cwd,
+            sidecar.exit_code,
+            &run_paths.log_path,
+            &run_paths.run_id,
+        )?;
+        display = finalize_sidecar_counts(&mut sidecar, show_paths, budget);
+        storage::write_sidecar(&run_paths.summary_path, &sidecar)?;
+        storage::record_run_state_unlocked(paths, entry, &sidecar)?;
+        Ok(())
+    }) {
+        eprintln!("kds: state commit failed: {err:#}; wrapped exit code preserved");
+        if sidecar.repeat_status.message == "pending" {
+            sidecar.repeat_status.message = "state unavailable".to_string();
+        }
+        display = finalize_sidecar_counts(&mut sidecar, show_paths, budget);
     }
-    if let Err(err) = storage::append_index(paths, entry) {
-        eprintln!("kds: run index write failed: {err:#}; wrapped exit code preserved");
+    (sidecar, display)
+}
+
+fn finalize_sidecar_counts(
+    sidecar: &mut SummarySidecar,
+    show_paths: bool,
+    budget: Option<SummaryBudget>,
+) -> String {
+    sidecar.shown_lines = summarize::compact_line_count_with_budget(sidecar, show_paths, budget);
+    sidecar.estimated_saved_lines = sidecar.raw_total_lines.saturating_sub(sidecar.shown_lines);
+    sidecar.estimated_output_reduction_percent =
+        storage::display_percent(sidecar.estimated_saved_lines, sidecar.raw_total_lines);
+    let display = summarize::format_compact_with_budget(sidecar, show_paths, budget);
+    sidecar.shown_chars = display.chars().count();
+    sidecar.estimated_saved_chars = sidecar.raw_total_chars.saturating_sub(sidecar.shown_chars);
+    sidecar.estimated_char_reduction_percent =
+        storage::display_percent(sidecar.estimated_saved_chars, sidecar.raw_total_chars);
+    sidecar.approx_shown_tokens = approximate_tokens(sidecar.shown_chars);
+    sidecar.approx_saved_tokens = sidecar
+        .approx_raw_tokens
+        .saturating_sub(sidecar.approx_shown_tokens);
+    display
+}
+
+fn placeholder_repeat_status(run_paths: &RunPaths) -> RepeatStatus {
+    RepeatStatus {
+        is_repeat: false,
+        message: "pending".to_string(),
+        first_seen: None,
+        previous_log_path: None,
+        current_log_path: run_paths.log_path.display().to_string(),
+        repeat_count: 0,
     }
-    if let Err(err) = update_metrics(paths, sidecar) {
-        eprintln!("kds: metrics write failed: {err:#}; wrapped exit code preserved");
+}
+
+fn approximate_tokens(chars: usize) -> usize {
+    chars.div_ceil(4)
+}
+
+fn budget_label(budget: Option<SummaryBudget>) -> &'static str {
+    match budget {
+        Some(SummaryBudget::Tight) => "tight",
+        Some(SummaryBudget::Wide) => "wide",
+        _ => "normal",
     }
 }
 
@@ -528,11 +637,110 @@ fn record_runtime_warning(warnings: &mut Vec<String>, label: &str, err: &anyhow:
 
 fn cleanup_stale_temps(paths: &Paths) {
     let stale_after = stale_temp_after();
-    match paths.cleanup_stale_temp_files(stale_after) {
-        Ok(0) => {}
-        Ok(removed) => eprintln!("kds: removed {removed} stale temp file(s)"),
+    let interval = temp_cleanup_interval();
+    match paths.cleanup_stale_temp_files_amortized(stale_after, interval) {
+        Ok(None) | Ok(Some(0)) => {}
+        Ok(Some(removed)) => eprintln!("kds: removed {removed} stale temp file(s)"),
         Err(err) => eprintln!("kds: stale temp cleanup failed: {err:#}"),
     }
+}
+
+fn apply_retention_controls(paths: &Paths) {
+    if let Some(days) = retention_days() {
+        match storage::gc_artifacts(
+            paths,
+            Duration::from_secs(days.saturating_mul(24 * 60 * 60)),
+            false,
+        ) {
+            Ok(report) if report.deleted_artifacts > 0 => {
+                eprintln!(
+                    "kds: pruned {} old artifact(s) by KDS_RETENTION_DAYS",
+                    report.deleted_artifacts
+                );
+            }
+            Ok(_) => {}
+            Err(err) => eprintln!("kds: retention pruning failed: {err:#}"),
+        }
+    }
+    if let Some(days) = compress_after_days() {
+        match storage::compress_artifacts_older_than(
+            paths,
+            Duration::from_secs(days.saturating_mul(24 * 60 * 60)),
+        ) {
+            Ok(report) if report.deleted_artifacts > 0 => {
+                eprintln!(
+                    "kds: compressed {} old raw log artifact(s)",
+                    report.deleted_artifacts
+                );
+            }
+            Ok(_) => {}
+            Err(err) => eprintln!("kds: log compression failed: {err:#}"),
+        }
+    }
+    if let Some(max_bytes) = max_total_log_bytes() {
+        match storage::prune_to_max_artifact_bytes(paths, max_bytes, false) {
+            Ok(report) if report.deleted_artifacts > 0 => {
+                eprintln!(
+                    "kds: pruned {} artifact(s) by KDS_MAX_TOTAL_LOG_BYTES",
+                    report.deleted_artifacts
+                );
+            }
+            Ok(_) => {}
+            Err(err) => eprintln!("kds: max-log pruning failed: {err:#}"),
+        }
+    }
+}
+
+fn retention_days() -> Option<u64> {
+    let raw = std::env::var("KDS_RETENTION_DAYS").ok()?;
+    match raw.parse::<u64>() {
+        Ok(0) => None,
+        Ok(days) => Some(days),
+        Err(_) => {
+            eprintln!("kds: ignoring invalid KDS_RETENTION_DAYS={raw:?}");
+            None
+        }
+    }
+}
+
+fn max_total_log_bytes() -> Option<u64> {
+    let raw = std::env::var("KDS_MAX_TOTAL_LOG_BYTES").ok()?;
+    parse_byte_limit(&raw).or_else(|| {
+        eprintln!("kds: ignoring invalid KDS_MAX_TOTAL_LOG_BYTES={raw:?}");
+        None
+    })
+}
+
+fn compress_after_days() -> Option<u64> {
+    let raw = std::env::var("KDS_COMPRESS_AFTER_DAYS").ok()?;
+    match raw.parse::<u64>() {
+        Ok(0) => None,
+        Ok(days) => Some(days),
+        Err(_) => {
+            eprintln!("kds: ignoring invalid KDS_COMPRESS_AFTER_DAYS={raw:?}");
+            None
+        }
+    }
+}
+
+fn parse_byte_limit(raw: &str) -> Option<u64> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "0" {
+        return None;
+    }
+    let split_at = trimmed
+        .find(|ch: char| !ch.is_ascii_digit())
+        .unwrap_or(trimmed.len());
+    let value: u64 = trimmed[..split_at].parse().ok()?;
+    let unit = trimmed[split_at..].trim().to_ascii_lowercase();
+    let multiplier = match unit.as_str() {
+        "" | "b" => 1,
+        "k" | "kb" | "kib" => 1024,
+        "m" | "mb" | "mib" => 1024 * 1024,
+        "g" | "gb" | "gib" => 1024 * 1024 * 1024,
+        _ => return None,
+    };
+    Some(value.saturating_mul(multiplier))
 }
 
 fn stale_temp_after() -> Duration {
@@ -541,6 +749,19 @@ fn stale_temp_after() -> Duration {
             Ok(seconds) => Duration::from_secs(seconds),
             Err(_) => {
                 eprintln!("kds: ignoring invalid KDS_STALE_TMP_SECS={raw:?}");
+                Duration::from_secs(24 * 60 * 60)
+            }
+        },
+        Err(_) => Duration::from_secs(24 * 60 * 60),
+    }
+}
+
+fn temp_cleanup_interval() -> Duration {
+    match std::env::var("KDS_TEMP_CLEANUP_INTERVAL_SECS") {
+        Ok(raw) => match raw.parse::<u64>() {
+            Ok(seconds) => Duration::from_secs(seconds),
+            Err(_) => {
+                eprintln!("kds: ignoring invalid KDS_TEMP_CLEANUP_INTERVAL_SECS={raw:?}");
                 Duration::from_secs(24 * 60 * 60)
             }
         },
@@ -618,6 +839,83 @@ fn terminate_process_tree(pid: u32) {
     }
 }
 
+struct ProgressNotice {
+    done: Option<mpsc::Sender<()>>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl ProgressNotice {
+    fn start(mode: Mode, started: Instant) -> Self {
+        if mode != Mode::Compact {
+            return Self {
+                done: None,
+                handle: None,
+            };
+        }
+        let Some(after) = progress_notice_after() else {
+            return Self {
+                done: None,
+                handle: None,
+            };
+        };
+        let (done_tx, done_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            if done_rx.recv_timeout(after).is_ok() {
+                return;
+            }
+            eprintln!(
+                "KDS: command still running... {} elapsed",
+                format_progress_elapsed(started.elapsed())
+            );
+            eprintln!("KDS: output captured locally, compact summary will print at completion");
+            let _ = done_rx.recv();
+        });
+        Self {
+            done: Some(done_tx),
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for ProgressNotice {
+    fn drop(&mut self) {
+        if let Some(done) = self.done.take() {
+            let _ = done.send(());
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn progress_notice_after() -> Option<Duration> {
+    match std::env::var("KDS_PROGRESS_AFTER_SECS") {
+        Ok(raw) => match raw.parse::<u64>() {
+            Ok(0) => None,
+            Ok(seconds) => Some(Duration::from_secs(seconds)),
+            Err(_) => {
+                eprintln!("kds: ignoring invalid KDS_PROGRESS_AFTER_SECS={raw:?}");
+                Some(Duration::from_secs(120))
+            }
+        },
+        Err(_) => Some(Duration::from_secs(120)),
+    }
+}
+
+fn format_progress_elapsed(duration: Duration) -> String {
+    let total = duration.as_secs();
+    let hours = total / 3600;
+    let minutes = (total % 3600) / 60;
+    let seconds = total % 60;
+    if hours > 0 {
+        format!("{hours}h{minutes:02}m{seconds:02}s")
+    } else if minutes > 0 {
+        format!("{minutes}m{seconds:02}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
 fn format_elapsed(ms: u128) -> String {
     if ms < 1000 {
         format!("{ms}ms")
@@ -630,24 +928,38 @@ fn format_elapsed(ms: u128) -> String {
 struct PipeCapture {
     captured_bytes: u64,
     discarded_bytes: u64,
+    raw_chars: usize,
+    summary: summarize::StreamSummary,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum StreamTee {
+    Stdout,
+    Stderr,
 }
 
 fn spawn_pipe_copy<R>(
     mut reader: R,
     mut file: fs::File,
     raw_byte_limit: Option<u64>,
+    stream: &'static str,
+    tee: Option<StreamTee>,
 ) -> thread::JoinHandle<io::Result<PipeCapture>>
 where
     R: Read + Send + 'static,
 {
     thread::spawn(move || {
         let mut capture = PipeCapture::default();
+        let mut summary = summarize::StreamSummaryBuilder::new(stream);
         let mut buffer = [0_u8; 8192];
         loop {
             let read = reader.read(&mut buffer)?;
             if read == 0 {
                 break;
             }
+            let raw = &buffer[..read];
+            summary.push_bytes(raw);
+            capture.raw_chars += String::from_utf8_lossy(raw).chars().count();
             let writable = match raw_byte_limit {
                 Some(limit) => limit
                     .saturating_sub(capture.captured_bytes)
@@ -658,13 +970,35 @@ where
                 file.write_all(&buffer[..writable])?;
                 capture.captured_bytes += writable as u64;
             }
+            if let Some(tee) = tee {
+                tee_bytes(tee, raw)?;
+            }
             if writable < read {
                 capture.discarded_bytes += (read - writable) as u64;
             }
         }
-        file.sync_all()?;
+        if durable_logs_enabled() {
+            file.sync_all()?;
+        }
+        capture.summary = summary.finish();
+        capture.summary.char_count = capture.raw_chars;
         Ok(capture)
     })
+}
+
+fn tee_bytes(tee: StreamTee, bytes: &[u8]) -> io::Result<()> {
+    match tee {
+        StreamTee::Stdout => {
+            let mut stdout = io::stdout().lock();
+            stdout.write_all(bytes)?;
+            stdout.flush()
+        }
+        StreamTee::Stderr => {
+            let mut stderr = io::stderr().lock();
+            stderr.write_all(bytes)?;
+            stderr.flush()
+        }
+    }
 }
 
 fn join_pipe_copy(
@@ -675,22 +1009,6 @@ fn join_pipe_copy(
         Ok(result) => Ok(result?),
         Err(_) => anyhow::bail!("{name} capture thread panicked"),
     }
-}
-
-fn copy_file_to_stdout(path: &std::path::Path) -> Result<()> {
-    let mut file = fs::File::open(path)?;
-    let mut stdout = io::stdout().lock();
-    io::copy(&mut file, &mut stdout)?;
-    stdout.flush()?;
-    Ok(())
-}
-
-fn copy_file_to_stderr(path: &std::path::Path) -> Result<()> {
-    let mut file = fs::File::open(path)?;
-    let mut stderr = io::stderr().lock();
-    io::copy(&mut file, &mut stderr)?;
-    stderr.flush()?;
-    Ok(())
 }
 
 fn raw_byte_limit() -> Option<u64> {
@@ -705,6 +1023,16 @@ fn raw_byte_limit() -> Option<u64> {
             None
         }
     }
+}
+
+fn durable_logs_enabled() -> bool {
+    matches!(
+        std::env::var("KDS_DURABLE_LOGS")
+            .ok()
+            .as_deref()
+            .map(str::trim),
+        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
+    )
 }
 
 struct TempFileCleanup(Vec<std::path::PathBuf>);

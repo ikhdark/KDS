@@ -11,7 +11,7 @@ pub fn run(id: String, show_paths: bool) -> Result<i32> {
     } else {
         storage::resolve_run_id(&paths, &id)?
     };
-    let sidecar = storage::read_sidecar(Path::new(&entry.summary_path))?;
+    let sidecar = storage::read_sidecar_for_display(Path::new(&entry.summary_path))?;
     print!(
         "{}",
         summarize::format_evidence_with_paths(&sidecar, show_paths)

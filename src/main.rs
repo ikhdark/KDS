@@ -3,6 +3,7 @@ mod digest;
 mod doctor;
 mod evidence;
 mod gain;
+mod gc;
 mod hook;
 mod init_codex;
 mod logs;
