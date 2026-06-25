@@ -4,10 +4,6 @@ KDS, short for KD Savings, is a command evidence runner for noisy developer
 commands. It keeps first output compact, gives every run a stable ID, and lets
 you drill into only the evidence slice you need later.
 
-KDS is RTK-style in installation and adoption UX only. KDS does not copy RTK
-code, command filters, hooks, branding, assets, README wording, or product
-scope, and it does not depend on RTK.
-
 ## What KDS Does
 
 - Routes allowlisted noisy commands through an automatic shell hook after
