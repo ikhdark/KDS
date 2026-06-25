@@ -187,7 +187,7 @@ if ([string]::IsNullOrWhiteSpace($inputJson)) {
 }
 
 try {
-  $event = $inputJson | ConvertFrom-Json -Depth 64
+  $event = $inputJson | ConvertFrom-Json
 } catch {
   exit 0
 }
@@ -346,7 +346,7 @@ function Update-KdsDesktopHooksConfig {
   $config = $null
   if (Test-Path -LiteralPath $ConfigPath -PathType Leaf) {
     try {
-      $config = Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json -Depth 64
+      $config = Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json
     } catch {
       Write-Warning "Existing hooks.json could not be parsed and will be replaced after backup: $ConfigPath"
     }
@@ -397,7 +397,7 @@ function Get-KdsDesktopHookTrustEntries {
   if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
     return @()
   }
-  $config = Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json -Depth 64
+  $config = Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json
   $hooks = Get-KdsJsonProperty $config "hooks"
   $preToolUse = @(Get-KdsJsonProperty $hooks "PreToolUse")
   if ($preToolUse.Count -eq 1 -and $null -eq $preToolUse[0]) {
