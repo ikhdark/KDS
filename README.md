@@ -20,6 +20,22 @@ only when you need it.
 - Records spawn failures as normal KDS runs and cleans up stale temp files from
   prior abnormal exits.
 
+## How It Saves Context And Usage
+
+Build and test commands can dump hundreds or thousands of lines into your
+terminal. In an AI coding workflow, that output often becomes model-visible
+context. KDS cuts that down by showing the useful first pass: run ID, exit code,
+timing, summary, warnings, errors, and the follow-up commands to inspect more.
+
+The full output is still saved locally, so you are not throwing evidence away.
+You only pull the raw log, error slice, or evidence pack when it is actually
+needed.
+
+`kds gain` reports an estimated line-based reduction: how many raw output lines
+were captured versus how many lines KDS showed first. It is not an exact token
+counter, but it gives you a practical read on how much terminal noise KDS kept
+out of the conversation.
+
 ## Quick Start
 
 Copy this into PowerShell:
