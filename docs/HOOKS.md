@@ -1,8 +1,15 @@
 # Hooks
 
-KDS V1 installs an automatic PowerShell hook by default on Windows.
-When installing or repairing the hook, KDS backs up an existing PowerShell
-profile before writing the managed block.
+KDS V1 installs automatic PowerShell activation by default on Windows. The
+Windows installer also installs or updates a Codex Desktop `PreToolUse` hook for
+detected Codex homes so allowlisted Desktop shell commands are routed through
+KDS without manual configuration.
+
+When installing or repairing hooks, KDS backs up an existing PowerShell profile,
+Desktop hook script, Desktop `hooks.json`, or Codex `config.toml` before
+rewriting it. For Desktop hooks, the installer also writes the matching
+`hooks.state` trust entry so the installed hook is active without a manual
+approval step.
 
 The hook is allowlisted and conservative. If it is uncertain, it runs the
 original command unchanged.
@@ -47,6 +54,10 @@ For Python, the automatic hook wraps test runners only: `pytest`,
 `python -m pytest`, and `python -m unittest`. Other `python ...` commands run
 natively because they may be interactive, long-running, or print sensitive
 operational output.
+
+The Codex Desktop hook rewrites matched shell commands to `kds.exe -- ...` so
+Desktop status text shows the short KDS command rather than the full local
+install path. It only rewrites simple commands without shell control operators.
 
 Managed PowerShell profile block:
 

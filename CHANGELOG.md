@@ -15,3 +15,8 @@
   spawn-failure artifacts, and concurrent run indexing.
 - Updated the PowerShell hook to invoke KDS by short executable name instead of
   displaying the full install path.
+- Added a one-line PowerShell bootstrap installer that downloads the source
+  archive, builds KDS, installs the binary, updates PATH, and activates
+  PowerShell plus Codex Desktop hooks automatically.
+- Added automatic Codex Desktop hook trust-state updates for KDS-installed
+  Desktop hooks.

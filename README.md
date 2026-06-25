@@ -25,16 +25,22 @@ scope, and it does not depend on RTK.
 
 ## Quick Start
 
-From a KDS source checkout:
+Copy and paste into PowerShell:
 
 ```powershell
-.\scripts\install.ps1
+irm https://raw.githubusercontent.com/ikhdark/KDS/main/scripts/bootstrap.ps1 | iex
 kds doctor
 ```
 
-After install and a new PowerShell session, allowlisted noisy build and test
-commands such as `cargo test` and `npm test` are routed through KDS
-automatically.
+The bootstrap installer downloads the KDS source archive, builds it locally,
+installs `kds.exe` under `%LOCALAPPDATA%\CodexKD\bin`, adds that directory to
+the user PATH, installs the PowerShell hook, and installs or updates the Codex
+Desktop hook for detected Codex homes. It requires Rust/Cargo to be available
+on PATH.
+
+After install, allowlisted noisy build and test commands such as `cargo test`
+and `npm test` are routed through KDS automatically in PowerShell and Codex
+Desktop where the hook is installed.
 
 Manual fallback/debug usage is also available:
 

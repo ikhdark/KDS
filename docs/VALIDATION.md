@@ -3,6 +3,8 @@
 Run:
 
 ```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\scripts\bootstrap.ps1 --dry-run
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 --dry-run
 cargo check
 cargo test
 cargo run -- --help

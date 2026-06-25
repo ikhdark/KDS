@@ -2,22 +2,34 @@
 
 ## Windows
 
+Copy-paste install:
+
+```powershell
+irm https://raw.githubusercontent.com/ikhdark/KDS/main/scripts/bootstrap.ps1 | iex
+```
+
+The bootstrap installer downloads the KDS source archive, builds it locally,
+and runs the Windows installer from that source. Rust/Cargo must already be
+available on PATH.
+
+From an existing KDS source checkout:
+
 ```powershell
 .\scripts\install.ps1
 ```
 
 The installer builds KDS locally, copies `kds.exe` into
-`%LOCALAPPDATA%\CodexKD\bin`, and installs the automatic PowerShell hook.
-If an existing PowerShell profile is rewritten, KDS writes a timestamped
-`.kds-backup-*` copy next to the profile first.
-
-The installer prints every path it writes. It does not silently edit PATH. If
-the install directory is not already on PATH, it prints the command/user action
-needed.
+`%LOCALAPPDATA%\CodexKD\bin`, adds that directory to the user PATH when needed,
+installs the automatic PowerShell hook, installs or updates the Codex Desktop
+hook for detected Codex homes, and writes the matching Codex hook trust state so
+the installed hook is active without a manual approval step. If an existing
+PowerShell profile, Desktop hook script, `hooks.json`, or `config.toml` is
+rewritten, KDS writes a timestamped `.kds-backup-*` copy next to the file first.
 
 After copying the binary, the installer validates that `kds.exe` exists, that
 `kds --version` runs, that the PowerShell hook is installed unless `--no-hook`
-was requested, and whether the install directory is visible on the user PATH.
+was requested, whether detected Codex Desktop hook files were updated, and
+whether the install directory is visible on the user PATH.
 
 Dry-run:
 
@@ -25,7 +37,7 @@ Dry-run:
 .\scripts\install.ps1 --dry-run
 ```
 
-Binary-only local install without editing the PowerShell profile:
+Binary-only local install without automatic hook activation:
 
 ```powershell
 .\scripts\install.ps1 --no-hook
