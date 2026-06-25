@@ -7,8 +7,8 @@
   allowlisted hook.
 - Unix shell hooks are not implemented in V1; Unix binary-only install is an
   explicit development/manual helper, not a product-style activated install.
-- RTK is UX inspiration only; no RTK dependency, code, filters, hooks, assets,
-  branding, wording, or command catalog.
+- KDS must stay original and must not depend on, copy, or vendor another command
+  wrapping tool.
 - V1 saves full raw logs locally and never truncates saved logs.
 - V1 does not provide stored raw-log dumping.
 - First response must stay compact.

@@ -36,8 +36,10 @@ this repository must stay independent from `codexKD2-main` and
 
 - KDS is automatic-hook-first: supported install means binary plus automatic
   allowlisted hook.
-- KDS must not install, vendor, shell out to, copy, or depend on RTK.
-- RTK may be mentioned only as install/adoption UX inspiration.
+- KDS must not install, vendor, shell out to, copy, or depend on another command
+  wrapping tool.
+- Other command wrapping tools may be mentioned only as install/adoption UX
+  inspiration.
 - Summaries, sidecars, indexes, evidence packs, and gain metrics are the
   product surface. Raw logs are local archival data.
 - By default, KDS saves raw stdout/stderr logs locally. If `KDS_MAX_RAW_BYTES`
