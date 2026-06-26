@@ -33,6 +33,8 @@ enum Command {
     Init(InitArgs),
     /// Manage automatic shell hooks.
     Hook(HookArgs),
+    /// Check for KDS updates.
+    Update(UpdateArgs),
 }
 
 #[derive(Debug, Args)]
@@ -67,8 +69,8 @@ pub struct SummarizeArgs {
 #[derive(Debug, Args)]
 pub struct LogsArgs {
     /// Run ID to inspect, or `last`. Omit to print safe storage stats.
-    #[arg(value_name = "RUN_ID|last", num_args = 0..=2)]
-    pub target: Vec<String>,
+    #[arg(value_name = "RUN_ID|last")]
+    pub target: Option<String>,
     #[arg(long)]
     pub show_paths: bool,
     #[arg(long)]
@@ -115,6 +117,18 @@ pub struct InitArgs {
 pub struct HookArgs {
     #[command(subcommand)]
     pub command: HookCommand,
+}
+
+#[derive(Debug, Args)]
+pub struct UpdateArgs {
+    #[command(subcommand)]
+    pub command: UpdateCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum UpdateCommand {
+    /// Check the latest GitHub release. This is an explicit opt-in network call.
+    Check,
 }
 
 #[derive(Debug, Subcommand)]
@@ -172,6 +186,7 @@ pub fn run() -> Result<i32> {
         Some(Command::Evidence(args)) => crate::evidence::run(args.id, args.show_paths),
         Some(Command::Init(args)) => crate::init_codex::run(args),
         Some(Command::Hook(args)) => crate::hook::run(args.command),
+        Some(Command::Update(args)) => crate::update::run(args.command),
         None => bail!("no command provided; use `kds -- <command...>` or `kds --help`"),
     }
 }

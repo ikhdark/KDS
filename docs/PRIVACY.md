@@ -2,11 +2,13 @@
 
 KDS has no telemetry in V1.
 
-KDS itself makes no network calls in V1. The public PowerShell bootstrap
-installer is fetched from a versioned tag, then downloads the matching release
-source archive and `.sha256` file from GitHub, verifies the archive, and builds
-KDS locally. It does not download a prebuilt binary and does not download or
-install Rust/Cargo.
+KDS normal runtime commands make no network calls in V1. The explicit
+`kds update check` command contacts GitHub to read the latest release metadata.
+The public PowerShell bootstrap installer is fetched from a versioned tag, then
+checks release metadata, downloads the matching release source archive and
+`.sha256` file from GitHub, verifies the archive, and builds KDS locally. It
+does not download a prebuilt binary and does not download or install
+Rust/Cargo.
 
 Default KDS runs are memory-only and do not write raw logs, temp stdout/stderr
 files, sidecars, run indexes, or metrics. Saved artifact mode is available only

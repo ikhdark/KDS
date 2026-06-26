@@ -165,6 +165,9 @@ By default, KDS is memory-only and does not write raw logs, sidecars, indexes,
 or metrics. Do not recommend saving local logs or enabling saved artifacts as a
 routine next action. KDS summaries are compact evidence, not proof of
 correctness beyond the wrapped command exit code or imported `--exit-code`.
+
+KDS normal commands do not call the network. Use `kds update check` only when
+the user explicitly wants to check GitHub for the latest release.
 "#
     .to_string()
 }
@@ -210,6 +213,7 @@ mod tests {
             "`git diff --check`",
             "tracked diff hash commands",
             "publish/install proof-line extraction",
+            "`kds update check`",
         ] {
             assert!(
                 guidance.contains(expected),

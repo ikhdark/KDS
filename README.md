@@ -84,6 +84,7 @@ kds logs <run-id|last> [--summary|--errors|--error-window|--tail|--file-hits|--s
 kds evidence last
 kds summarize --file .\ci.log --name github-actions
 kds clean --older-than 30d
+kds update check
 kds doctor
 kds hook status
 kds hook uninstall powershell
@@ -116,6 +117,10 @@ Use `KDS_RETENTION_DAYS` to remove old local run artifacts on run start, and
 `KDS_MAX_TOTAL_LOG_BYTES` to keep local KDS artifacts under a disk budget.
 `KDS_COMPRESS_AFTER_DAYS` gzips older raw `.log` files and updates matching
 sidecars to point at the compressed path.
+
+KDS does not check for updates during normal commands. The bootstrap installer
+prints installed and latest release versions before installing. To check from
+the CLI, run `kds update check`; that command is an explicit network opt-in.
 
 After artifact deletion, KDS reconciles current lookup state by dropping run
 index entries whose sidecars are gone, rebuilding `latest-by-command`, and

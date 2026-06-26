@@ -20,6 +20,7 @@ Scope: `src/`.
 - `hook.rs` owns managed PowerShell hook text, hook install/uninstall/status,
   and hook allowlist behavior.
 - `init_codex.rs` owns managed Codex guidance under `CODEX_HOME`.
+- `update.rs` owns the explicit opt-in GitHub release update check.
 
 ## Product Invariants
 
@@ -40,7 +41,8 @@ Scope: `src/`.
 - Keep `doctor` and `hook doctor` read-only.
 - Keep cleanup commands limited to KDS-owned artifacts under the resolved logs
   tree.
-- Do not add telemetry or runtime network calls.
+- Do not add telemetry. Runtime network calls are allowed only for explicit
+  user opt-in update checks such as `kds update check`.
 
 ## Hook Invariants
 

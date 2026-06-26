@@ -7,7 +7,7 @@ KDS is a standalone public Rust CLI. Keep this repository independent from
 
 - `src/main.rs` wires the binary entrypoint to `cli::run`.
 - `src/cli.rs` defines the Clap command surface: `run`, `raw`, `gain`,
-  `clean`, `doctor`, `logs`, `evidence`, `init`, and `hook`.
+  `clean`, `doctor`, `logs`, `evidence`, `init`, `hook`, and `update`.
 - `src/runner.rs` executes wrapped commands, preserves exit codes, captures
   stdout/stderr, produces memory-only summaries by default, writes raw logs and
   summary sidecars only in saved-artifact mode, updates indexes/metrics/digest
@@ -25,6 +25,7 @@ KDS is a standalone public Rust CLI. Keep this repository independent from
 - `src/hook.rs` owns the managed PowerShell hook block and automatic hook
   allowlist.
 - `src/init_codex.rs` owns managed Codex guidance under `CODEX_HOME`.
+- `src/update.rs` owns the explicit opt-in GitHub release update check.
 - `scripts/bootstrap.ps1` downloads the public source archive and runs the
   installer from that extracted source.
 - `scripts/install.ps1` is the Windows product installer. It builds the binary,
@@ -57,8 +58,9 @@ KDS is a standalone public Rust CLI. Keep this repository independent from
   next actions, or default troubleshooting steps. Treat saved artifacts as an
   explicit user-directed opt-in only.
 - Do not add telemetry in V1.
-- Do not add network calls in V1 except future explicit release installer
-  downloads with checksum verification.
+- Do not add network calls in V1 except explicit release installer downloads
+  with checksum verification, installer-time release metadata checks, and the
+  opt-in `kds update check` command.
 - Do not download or install Rust/Cargo. Source-based installers may require
   Cargo on PATH and must fail clearly if it is missing.
 - Do not add a stored raw-log display command in V1.

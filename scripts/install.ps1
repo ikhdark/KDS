@@ -81,6 +81,35 @@ function Get-KdsTimestamp {
   return (Get-Date).ToString("yyyyMMddTHHmmssfffffff")
 }
 
+function Get-KdsInstalledVersion {
+  param([string]$Path)
+  if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+    return "not installed"
+  }
+  try {
+    $output = & $Path --version 2>$null
+    if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($output)) {
+      return [string]$output
+    }
+  } catch {
+  }
+  return "installed, version unavailable"
+}
+
+function Get-KdsSourceVersion {
+  param([string]$Repo)
+  $cargoToml = Join-Path $Repo "Cargo.toml"
+  if (-not (Test-Path -LiteralPath $cargoToml -PathType Leaf)) {
+    return "unknown"
+  }
+  $text = Get-Content -LiteralPath $cargoToml -Raw
+  $match = [regex]::Match($text, '(?m)^version\s*=\s*"([^"]+)"')
+  if ($match.Success) {
+    return $match.Groups[1].Value
+  }
+  return "unknown"
+}
+
 function Get-KdsUniqueSiblingPath {
   param(
     [string]$Path,
@@ -813,6 +842,7 @@ Usage:
   ./scripts/install.ps1 [--dry-run] [--no-hook] [--help]
 
 Behavior:
+  - prints installed and source versions before building
   - builds KDS from this repository
   - requires Rust/Cargo to already be available on PATH
   - never downloads or installs Rust/Cargo
@@ -830,11 +860,15 @@ $targetExe = Join-Path $installDir "kds.exe"
 $builtExe = Join-Path $repo "target\release\kds.exe"
 $userPathEntries = Split-KdsPathList ([Environment]::GetEnvironmentVariable("Path", "User"))
 $pathHasInstallDir = Test-KdsPathListContains $userPathEntries $installDir
+$installedVersion = Get-KdsInstalledVersion $targetExe
+$sourceVersion = Get-KdsSourceVersion $repo
 
 Write-Host "KDS install plan"
 Write-Host "Repository: $repo"
 Write-Host "Install directory: $installDir"
 Write-Host "Binary: $targetExe"
+Write-Host "Installed version: $installedVersion"
+Write-Host "Source version: $sourceVersion"
 Write-Host "User PATH: $(if ($pathHasInstallDir) { 'already includes install directory' } else { 'will add install directory' })"
 if ($NoHook) {
   Write-Host "Automatic hooks: skipped by --no-hook"

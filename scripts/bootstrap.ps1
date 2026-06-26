@@ -23,6 +23,8 @@ foreach ($arg in $args) {
 
 $archiveUrl = "https://github.com/ikhdark/KDS/releases/download/$Version/KDS-$Version-source.zip"
 $checksumUrl = "$archiveUrl.sha256"
+$latestReleaseApi = "https://api.github.com/repos/ikhdark/KDS/releases/latest"
+$releasesUrl = "https://github.com/ikhdark/KDS/releases"
 
 function Get-KdsFileSha256 {
   param([string]$Path)
@@ -39,6 +41,37 @@ function Read-KdsExpectedSha256 {
   return $match.Value.ToLowerInvariant()
 }
 
+function Get-KdsInstalledVersion {
+  $installed = Get-Command kds.exe,kds -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+  if (-not $installed) {
+    return "not installed"
+  }
+  try {
+    $output = & $installed.Source --version 2>$null
+    if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($output)) {
+      return [string]$output
+    }
+  } catch {
+  }
+  return "installed, version unavailable"
+}
+
+function Get-KdsLatestReleaseVersion {
+  try {
+    $headers = @{
+      "User-Agent" = "KDS-bootstrap/$Version"
+      "Accept" = "application/vnd.github+json"
+    }
+    $release = Invoke-RestMethod -Uri $latestReleaseApi -Headers $headers -UseBasicParsing
+    if ($release -and -not [string]::IsNullOrWhiteSpace([string]$release.tag_name)) {
+      return [string]$release.tag_name
+    }
+  } catch {
+    Write-Warning "Update check failed: $($_.Exception.Message)"
+  }
+  return "unknown"
+}
+
 if ($Help) {
   @"
 KDS bootstrap installer
@@ -47,6 +80,7 @@ Copy-paste install:
   irm https://raw.githubusercontent.com/ikhdark/KDS/$Version/scripts/bootstrap.ps1 | iex
 
 Behavior:
+  - prints installed and latest release versions before installing
   - downloads the versioned KDS release source archive
   - verifies the archive SHA-256 checksum from the matching release asset
   - requires Rust/Cargo to already be available on PATH
@@ -61,10 +95,21 @@ Write-Host "KDS bootstrap install"
 Write-Host "Version: $Version"
 Write-Host "Source archive: $archiveUrl"
 Write-Host "Checksum: $checksumUrl"
+Write-Host "Releases: $releasesUrl"
 
 if ($DryRun) {
+  Write-Host "Update check: skipped in dry run"
   Write-Host "Dry run: no download, no checksum verification, no extraction, no Rust/Cargo install, no build, no install."
   exit 0
+}
+
+$installedVersion = Get-KdsInstalledVersion
+$latestVersion = Get-KdsLatestReleaseVersion
+Write-Host "Installed version: $installedVersion"
+Write-Host "Latest release: $latestVersion"
+if ($latestVersion -ne "unknown" -and $latestVersion -ne $Version) {
+  Write-Host "Bootstrap target: $Version"
+  Write-Host "A different latest release is available. To install it, use the bootstrap URL for $latestVersion from $releasesUrl."
 }
 
 $cargo = Get-Command cargo -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1

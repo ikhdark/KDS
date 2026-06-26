@@ -8,10 +8,6 @@ use crate::summarize;
 pub fn run(args: LogsArgs) -> Result<i32> {
     let paths = storage::Paths::discover()?;
     match resolve_request(args)? {
-        LogsRequest::Dir => {
-            println!("{}", paths.logs_dir.display());
-            Ok(0)
-        }
         LogsRequest::Stats { show_paths } => {
             let stats = storage::log_stats(&paths)?;
             println!("KDS logs stats");
@@ -58,7 +54,6 @@ enum LogsSection {
 
 #[derive(Debug, PartialEq, Eq)]
 enum LogsRequest {
-    Dir,
     Stats {
         show_paths: bool,
     },
@@ -71,8 +66,6 @@ enum LogsRequest {
 
 enum Positional {
     None,
-    Dir,
-    Stats,
     Run(String),
 }
 
@@ -80,19 +73,6 @@ fn resolve_request(args: LogsArgs) -> Result<LogsRequest> {
     let section = section_from_flags(&args)?;
     let positional = positional_request(args.target)?;
     let section_requested = section != LogsSection::Metadata;
-
-    if matches!(positional, Positional::Dir) {
-        if args.show_paths || section_requested {
-            anyhow::bail!("choose only one logs action");
-        }
-        return Ok(LogsRequest::Dir);
-    }
-
-    if matches!(positional, Positional::Stats) {
-        return Ok(LogsRequest::Stats {
-            show_paths: args.show_paths,
-        });
-    }
 
     if let Positional::Run(id) = positional {
         return Ok(LogsRequest::Run {
@@ -144,19 +124,16 @@ fn section_from_flags(args: &LogsArgs) -> Result<LogsSection> {
     }
 }
 
-fn positional_request(tokens: Vec<String>) -> Result<Positional> {
-    match tokens.as_slice() {
-        [] => Ok(Positional::None),
-        [token] if token == "dir" => Ok(Positional::Dir),
-        [token] if token == "stats" => Ok(Positional::Stats),
-        [token] if token == "show" => {
-            anyhow::bail!("missing run id after `show`; use `kds logs last` or `kds logs <run-id>`")
-        }
-        [id] => Ok(Positional::Run(id.clone())),
-        [command, id] if command == "show" => Ok(Positional::Run(id.clone())),
-        _ => anyhow::bail!(
-            "unrecognized logs arguments; use `kds logs [RUN_ID|last] [--errors|--error-window]`"
+fn positional_request(target: Option<String>) -> Result<Positional> {
+    match target.as_deref() {
+        None => Ok(Positional::None),
+        Some("dir") | Some("stats") => anyhow::bail!(
+            "logs dir/stats aliases were removed; use `kds logs` or `kds logs --show-paths`"
         ),
+        Some("show") => {
+            anyhow::bail!("logs show alias was removed; use `kds logs last` or `kds logs <run-id>`")
+        }
+        Some(id) => Ok(Positional::Run(id.to_string())),
     }
 }
 

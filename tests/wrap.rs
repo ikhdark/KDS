@@ -425,11 +425,31 @@ fn doctor_reports_malformed_state_without_creating_logs() {
         "stdout:\n{stdout}"
     );
     assert!(
+        stdout.contains("Update check: run `kds update check`"),
+        "stdout:\n{stdout}"
+    );
+    assert!(
         !kds_home.path().join("logs").exists(),
         "doctor should not create logs dir"
     );
     assert!(stdout.contains("Codex Desktop hook:"), "stdout:\n{stdout}");
     assert!(stdout.contains("Codex hooks.json:"), "stdout:\n{stdout}");
+}
+
+#[test]
+fn update_help_exposes_explicit_check_command_without_network() {
+    let output = Command::new(kds_bin())
+        .arg("update")
+        .arg("--help")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("check"), "stdout:\n{stdout}");
+    assert!(
+        stdout.contains("Check for KDS updates") || stdout.contains("Usage:"),
+        "stdout:\n{stdout}"
+    );
 }
 
 #[test]
@@ -518,6 +538,22 @@ fn logs_stats_reports_safe_artifact_counts() {
     assert!(
         stdout.contains(&kds_home.path().join("logs").display().to_string()),
         "stdout:\n{stdout}"
+    );
+}
+
+#[test]
+fn logs_rejects_removed_show_alias() {
+    let output = Command::new(kds_bin())
+        .arg("logs")
+        .arg("show")
+        .arg("last")
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unexpected argument") || stderr.contains("logs show alias was removed"),
+        "stderr:\n{stderr}"
     );
 }
 

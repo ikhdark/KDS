@@ -13,6 +13,8 @@ pub fn run() -> Result<i32> {
     let paths = storage::Paths::discover()?;
     println!("KDS doctor");
     println!("Version: {}", env!("CARGO_PKG_VERSION"));
+    println!("Releases: https://github.com/ikhdark/KDS/releases");
+    println!("Update check: run `kds update check` (explicit network opt-in)");
     match std::env::current_exe() {
         Ok(exe) => {
             println!("Current executable: {}", exe.display());

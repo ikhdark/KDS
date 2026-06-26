@@ -11,6 +11,7 @@ mod logs;
 mod runner;
 mod storage;
 mod summarize;
+mod update;
 
 fn main() {
     let code = match cli::run() {

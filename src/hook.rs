@@ -141,8 +141,8 @@ if ($global:KdsExeDir -and -not (($env:PATH -split ';') -contains $global:KdsExe
 }}
 function KDS {{
   $kdsArgs = @($args)
-  $kdsCommands = @('run','raw','summarize','gain','clean','doctor','logs','evidence','init','hook','help')
-  if ($kdsArgs.Count -gt 0 -and -not ([string]$kdsArgs[0]).StartsWith('-') -and -not ($kdsCommands -contains [string]$kdsArgs[0])) {{
+  $kdsStatement = [string]$MyInvocation.Statement
+  if ($kdsStatement -match '(?i)^\s*KDS\s+--(?:\s|$)' -and ($kdsArgs.Count -eq 0 -or [string]$kdsArgs[0] -ne '--')) {{
     $kdsArgs = @('--') + $kdsArgs
   }}
   & $global:KdsCommand @kdsArgs
@@ -535,10 +535,7 @@ mod tests {
     fn hook_block_wraps_with_friendly_kds_entrypoint() {
         let block = hook_block().unwrap();
         assert!(block.contains("function KDS {"), "block:\n{block}");
-        assert!(
-            block.contains("$kdsCommands = @('run','raw','summarize','gain','clean','doctor','logs','evidence','init','hook','help')"),
-            "block:\n{block}"
-        );
+        assert!(!block.contains("$kdsCommands = @("), "block:\n{block}");
         assert!(
             block.contains("$kdsArgs = @('--', $Name) + $Rest"),
             "block:\n{block}"

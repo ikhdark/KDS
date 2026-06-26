@@ -14,6 +14,7 @@ cargo run -- doctor
 cargo run -- logs
 cargo run -- logs --show-paths
 cargo run -- clean --older-than 30d
+cargo run -- update --help
 cargo run -- -- node --version
 cargo run -- raw -- node --version
 "error: synthetic failure" | cargo run -- summarize --name synthetic-ci --exit-code 1
@@ -37,10 +38,13 @@ for saved failures, repeated "same failure signal" wording, safe drilldown, and
 no mutation of real global config during tests.
 
 Bootstrap dry-run should print the versioned release source archive and checksum
-URL without downloading either file. Installer dry-run should avoid file writes,
-PATH edits, builds, Rust/Cargo installation, profile edits, and Codex Desktop
-hook edits. With Cargo absent from PATH, bootstrap and installer flows should
-fail clearly before any source download or build attempt.
+URL, skip the update check, and avoid downloading files. Installer dry-run
+should avoid file writes, PATH edits, builds, Rust/Cargo installation, profile
+edits, and Codex Desktop hook edits. With Cargo absent from PATH, bootstrap and
+installer flows should fail clearly before any source download or build attempt.
+Non-dry-run bootstrap output should print installed and latest release versions
+before downloading source. `kds update check` is the only runtime update check
+and is an explicit network opt-in.
 
 Hook profile validation should cover both the managed PowerShell hook and Codex
 Desktop hook matcher. Verify built-in profiles for JavaScript/TypeScript,

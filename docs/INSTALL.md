@@ -14,6 +14,10 @@ the Windows installer from that source. It does not download a prebuilt binary.
 Rust/Cargo must already be available on PATH. KDS does not download or install
 Rust/Cargo.
 
+Before downloading source, the bootstrap prints the installed KDS version when
+one is available and the latest GitHub release version. This release metadata
+check is installer-time only and is skipped in `--dry-run`.
+
 From an existing KDS source checkout:
 
 ```powershell
@@ -30,6 +34,11 @@ PowerShell profile, Desktop hook script, `hooks.json`, or `config.toml` is
 rewritten, KDS writes a unique `.kds-backup-*` copy next to the file first, then
 writes replacement text through a same-directory temp file before replacing the
 target.
+
+From a source checkout, the installer prints the currently installed version
+and the source version it is about to build. It does not perform a network
+update check; use `kds update check` when you explicitly want KDS to contact
+GitHub for the latest release.
 
 After copying the binary, the installer validates that `kds.exe` exists, that
 `kds --version` runs, that the PowerShell hook is installed unless `--no-hook`

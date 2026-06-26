@@ -11,6 +11,8 @@
   wrapping tool.
 - KDS installers must not download or install Rust/Cargo. Source-based install
   requires Cargo to already be on PATH and must fail clearly when it is missing.
+- Normal KDS runtime commands must not call the network. Update checks are
+  explicit: installer-time release metadata checks and `kds update check`.
 - V1 is memory-only by default: wrapped commands and imported logs must not
   write raw logs, temp stdout/stderr files, sidecars, run indexes, or metrics
   unless artifact saving is explicitly enabled.

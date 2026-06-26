@@ -21,8 +21,9 @@ Scope: `docs/`.
 - Preserve the distinction between safe displayed summaries and explicitly
   saved local archival raw logs.
 - Document `--show-paths` as the explicit opt-in for local paths.
-- Preserve V1 constraints: no telemetry, no stored raw-log display command, no
-  runtime network calls, and PowerShell-only automatic activation.
+- Preserve V1 constraints: no telemetry, no stored raw-log display command,
+  runtime network only for explicit update checks or installer release checks,
+  and PowerShell-only automatic activation.
 - State that KDS does not download or install Rust/Cargo; source-based install
   requires Cargo to already be available on PATH.
 - Use the wording "same failure signal" for repeated-failure behavior.

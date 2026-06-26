@@ -25,8 +25,9 @@ Scope: `scripts/`.
   to installer-created temporary directories or explicit KDS-owned targets.
 - Preserve existing user profile content outside the managed KDS block.
 - Do not add telemetry.
-- Do not add runtime network calls beyond the explicit source-archive bootstrap
-  download. Future binary downloads require checksum verification.
+- Do not add runtime network calls beyond explicit source-archive bootstrap
+  downloads, installer-time release metadata checks, and checksum verification.
+  Future binary downloads require checksum verification.
 
 ## Installer Behavior
 
