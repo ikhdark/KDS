@@ -6,8 +6,8 @@ KDS is a standalone public Rust CLI. Keep this repository independent from
 ## Current Project Shape
 
 - `src/main.rs` wires the binary entrypoint to `cli::run`.
-- `src/cli.rs` defines the Clap command surface: `run`, `raw`, `gain`, `gc`,
-  `prune`, `doctor`, `logs`, `evidence`, `init`, and `hook`.
+- `src/cli.rs` defines the Clap command surface: `run`, `raw`, `gain`,
+  `clean`, `doctor`, `logs`, `evidence`, `init`, and `hook`.
 - `src/runner.rs` executes wrapped commands, preserves exit codes, captures
   stdout/stderr, produces memory-only summaries by default, writes raw logs and
   summary sidecars only in saved-artifact mode, updates indexes/metrics/digest
@@ -59,6 +59,8 @@ KDS is a standalone public Rust CLI. Keep this repository independent from
 - Do not add telemetry in V1.
 - Do not add network calls in V1 except future explicit release installer
   downloads with checksum verification.
+- Do not download or install Rust/Cargo. Source-based installers may require
+  Cargo on PATH and must fail clearly if it is missing.
 - Do not add a stored raw-log display command in V1.
 - Never let digest/delta logic skip command execution.
 
@@ -67,11 +69,13 @@ KDS is a standalone public Rust CLI. Keep this repository independent from
 - V1 automatic activation is PowerShell-only.
 - Keep the PowerShell hook conservative and allowlisted. If behavior is
   uncertain, run the native command unchanged.
-- The hook may wrap noisy non-interactive verification commands:
-  `cargo check/test/build/clippy`, safe `just` recipes, safe `npm`/`pnpm`
-  scripts, `pytest`, `python -m pytest`, and `python -m unittest`.
-- Safe package and recipe names are `test`, `build`, `check`, `lint`,
-  `typecheck`, `ci`, and `clippy`.
+- The hook may wrap noisy non-interactive verification commands through
+  built-in profiles for JavaScript/TypeScript, Python, Go, Java/Kotlin, .NET,
+  PHP, Ruby, Elixir, C/C++, and common task runners.
+- Safe package, recipe, and task categories are `test`, `build`, `check`,
+  `lint`, `typecheck`, `format-check`, `ci`, `clippy`, `vet`, and `compile`.
+  Other task names should run natively unless a profile explicitly proves they
+  are bounded verification commands.
 - Do not wrap Git commands automatically. Preserve native passthrough for
   `git diff ...` and other proof-style Git commands even when explicitly run
   through KDS.

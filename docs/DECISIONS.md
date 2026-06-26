@@ -9,6 +9,8 @@
   explicit development/manual helper, not a product-style activated install.
 - KDS must stay original and must not depend on, copy, or vendor another command
   wrapping tool.
+- KDS installers must not download or install Rust/Cargo. Source-based install
+  requires Cargo to already be on PATH and must fail clearly when it is missing.
 - V1 is memory-only by default: wrapped commands and imported logs must not
   write raw logs, temp stdout/stderr files, sidecars, run indexes, or metrics
   unless artifact saving is explicitly enabled.

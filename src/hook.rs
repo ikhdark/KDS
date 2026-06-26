@@ -141,7 +141,7 @@ if ($global:KdsExeDir -and -not (($env:PATH -split ';') -contains $global:KdsExe
 }}
 function KDS {{
   $kdsArgs = @($args)
-  $kdsCommands = @('run','raw','summarize','gain','gc','prune','doctor','logs','evidence','init','hook','help')
+  $kdsCommands = @('run','raw','summarize','gain','clean','doctor','logs','evidence','init','hook','help')
   if ($kdsArgs.Count -gt 0 -and -not ([string]$kdsArgs[0]).StartsWith('-') -and -not ($kdsCommands -contains [string]$kdsArgs[0])) {{
     $kdsArgs = @('--') + $kdsArgs
   }}
@@ -209,100 +209,262 @@ function _kds_wrap {{
 }}
 function _kds_safe_task {{
   param([string]$Name)
-  return ([string]$Name) -match '^(test|build|check|lint|typecheck|ci|clippy)(-[A-Za-z0-9_.-]+)?$'
+  return ([string]$Name) -match '^(test|build|check|lint|typecheck|format-check|fmt-check|ci|clippy|vet|compile)(-[A-Za-z0-9_.-]+)?$'
 }}
 function _kds_has_flag {{
   param([object[]]$Rest, [string[]]$Flags)
   foreach ($arg in $Rest) {{
-    if ($Flags -contains [string]$arg) {{ return $true }}
+    if ($Flags -contains ([string]$arg).ToLowerInvariant()) {{ return $true }}
   }}
   return $false
+}}
+function _kds_has_blocking_arg {{
+  param([object[]]$Rest)
+  return (_kds_has_flag $Rest @('--watch','--watchall','--watch-all','-w','--ui','--serve','--dev','--inspect','--inspect-brk'))
+}}
+function _kds_first_non_flag {{
+  param([object[]]$Rest)
+  foreach ($arg in $Rest) {{
+    $text = [string]$arg
+    if ([string]::IsNullOrWhiteSpace($text)) {{ continue }}
+    if ($text -eq '--') {{ continue }}
+    if ($text.StartsWith('-')) {{ continue }}
+    return $text
+  }}
+  return $null
 }}
 function _kds_safe_python_module {{
   param([string]$Name)
   return @('pytest','unittest','ruff','mypy','pyright') -contains [string]$Name
 }}
+function _kds_script_profile {{
+  param([object[]]$Rest)
+  $first = _kds_first_non_flag $Rest
+  if ($null -ne $first -and (_kds_safe_task $first)) {{ return $true }}
+  if ($Rest.Count -ge 2 -and @('run','run-script') -contains ([string]$Rest[0]).ToLowerInvariant() -and (_kds_safe_task $Rest[1])) {{ return $true }}
+  return $false
+}}
+function _kds_gradle_profile {{
+  param([object[]]$Rest)
+  $task = (_kds_first_non_flag $Rest)
+  if ($null -eq $task) {{ return $false }}
+  $lower = ([string]$task).ToLowerInvariant()
+  if ($lower -match '(publish|deploy|upload|release|sign)') {{ return $false }}
+  return ($lower -match '^(test|check|build|lint|compile[a-z0-9_.-]*|.*test.*|.*check)$')
+}}
+function _kds_profile_should_wrap {{
+  param([string]$Name, [object[]]$Rest)
+  $command = ([string]$Name).ToLowerInvariant()
+  switch ($command) {{
+    'cargo' {{ return ($Rest.Count -gt 0 -and @('check','test','build','clippy') -contains ([string]$Rest[0]).ToLowerInvariant()) }}
+    {{ @('just','make','task') -contains $_ }} {{ return (_kds_script_profile $Rest) }}
+    {{ @('npm','pnpm','yarn','bun') -contains $_ }} {{
+      if ($Rest.Count -gt 0 -and ([string]$Rest[0]).ToLowerInvariant() -eq 'test') {{ return $true }}
+      return (_kds_script_profile $Rest)
+    }}
+    'deno' {{
+      if ($Rest.Count -gt 0 -and @('test','check','lint') -contains ([string]$Rest[0]).ToLowerInvariant()) {{ return $true }}
+      return ($Rest.Count -ge 2 -and ([string]$Rest[0]).ToLowerInvariant() -eq 'task' -and (_kds_safe_task $Rest[1]))
+    }}
+    {{ @('tsc','vue-tsc','jest','vitest') -contains $_ }} {{ return -not (_kds_has_blocking_arg $Rest) }}
+    'eslint' {{ return $true }}
+    'biome' {{ return ($Rest.Count -gt 0 -and @('check','ci','lint') -contains ([string]$Rest[0]).ToLowerInvariant()) }}
+    'prettier' {{ return (_kds_has_flag $Rest @('--check','-c')) }}
+    'playwright' {{ return ($Rest.Count -gt 0 -and ([string]$Rest[0]).ToLowerInvariant() -eq 'test') }}
+    'pytest' {{ return $true }}
+    {{ @('python','py') -contains $_ }} {{ return ($Rest.Count -ge 2 -and [string]$Rest[0] -eq '-m' -and (_kds_safe_python_module $Rest[1])) }}
+    'ruff' {{
+      return ($Rest.Count -gt 0 -and (([string]$Rest[0]).ToLowerInvariant() -eq 'check' -or (([string]$Rest[0]).ToLowerInvariant() -eq 'format' -and (_kds_has_flag $Rest @('--check')))))
+    }}
+    {{ @('mypy','pyright') -contains $_ }} {{ return $true }}
+    'uv' {{ return ($Rest.Count -ge 2 -and ([string]$Rest[0]).ToLowerInvariant() -eq 'run' -and (_kds_safe_python_module $Rest[1])) }}
+    'go' {{ return ($Rest.Count -gt 0 -and @('test','build','vet') -contains ([string]$Rest[0]).ToLowerInvariant()) }}
+    'dotnet' {{ return ($Rest.Count -gt 0 -and @('test','build') -contains ([string]$Rest[0]).ToLowerInvariant()) }}
+    {{ @('mvn','mvnw','maven') -contains $_ }} {{
+      $goal = _kds_first_non_flag $Rest
+      return ($null -ne $goal -and @('test','verify','package','compile') -contains ([string]$goal).ToLowerInvariant())
+    }}
+    {{ @('gradle','gradlew') -contains $_ }} {{ return (_kds_gradle_profile $Rest) }}
+    'composer' {{ return (_kds_script_profile $Rest) }}
+    'phpunit' {{ return $true }}
+    'bundle' {{ return ($Rest.Count -ge 2 -and ([string]$Rest[0]).ToLowerInvariant() -eq 'exec' -and @('rspec','rake','rails') -contains ([string]$Rest[1]).ToLowerInvariant() -and ($Rest.Count -lt 3 -or (_kds_safe_task $Rest[2]) -or ([string]$Rest[1]).ToLowerInvariant() -eq 'rspec')) }}
+    'rails' {{ return ($Rest.Count -gt 0 -and ([string]$Rest[0]).ToLowerInvariant() -eq 'test') }}
+    'rspec' {{ return $true }}
+    'mix' {{ return ($Rest.Count -gt 0 -and @('test','compile') -contains ([string]$Rest[0]).ToLowerInvariant()) }}
+    'cmake' {{ return ($Rest.Count -gt 0 -and ([string]$Rest[0]).ToLowerInvariant() -eq '--build') }}
+    'ninja' {{ return (_kds_script_profile $Rest) }}
+    'ctest' {{ return $true }}
+    'mise' {{ return ($Rest.Count -ge 2 -and @('run','r') -contains ([string]$Rest[0]).ToLowerInvariant() -and (_kds_safe_task $Rest[1])) }}
+    default {{ return $false }}
+  }}
+}}
+function _kds_profile_call {{
+  param([string]$Name, [object[]]$Rest)
+  if (_kds_profile_should_wrap $Name $Rest) {{ _kds_wrap $Name $Rest }} else {{ _kds_call_native $Name $Rest }}
+}}
 function cargo {{
   $rest = @(_kds_restore_args $args $MyInvocation.Statement)
-  if ($rest.Count -gt 0 -and @('check','test','build','clippy') -contains $rest[0]) {{ _kds_wrap 'cargo' $rest }} else {{ _kds_call_native 'cargo' $rest }}
+  _kds_profile_call 'cargo' $rest
 }}
 function just {{
   $rest = @(_kds_restore_args $args $MyInvocation.Statement)
-  if ($rest.Count -gt 0 -and (_kds_safe_task $rest[0])) {{ _kds_wrap 'just' $rest }} else {{ _kds_call_native 'just' $rest }}
+  _kds_profile_call 'just' $rest
 }}
 function npm {{
   $rest = @(_kds_restore_args $args $MyInvocation.Statement)
-  if ($rest.Count -gt 0 -and $rest[0] -eq 'test') {{ _kds_wrap 'npm' $rest }} elseif ($rest.Count -ge 2 -and $rest[0] -eq 'run' -and (_kds_safe_task $rest[1])) {{ _kds_wrap 'npm' $rest }} else {{ _kds_call_native 'npm' $rest }}
+  _kds_profile_call 'npm' $rest
 }}
 function pnpm {{
   $rest = @(_kds_restore_args $args $MyInvocation.Statement)
-  if ($rest.Count -gt 0 -and $rest[0] -eq 'test') {{ _kds_wrap 'pnpm' $rest }} elseif ($rest.Count -ge 2 -and $rest[0] -eq 'run' -and (_kds_safe_task $rest[1])) {{ _kds_wrap 'pnpm' $rest }} else {{ _kds_call_native 'pnpm' $rest }}
+  _kds_profile_call 'pnpm' $rest
+}}
+function yarn {{
+  $rest = @(_kds_restore_args $args $MyInvocation.Statement)
+  _kds_profile_call 'yarn' $rest
+}}
+function bun {{
+  $rest = @(_kds_restore_args $args $MyInvocation.Statement)
+  _kds_profile_call 'bun' $rest
+}}
+function deno {{
+  $rest = @(_kds_restore_args $args $MyInvocation.Statement)
+  _kds_profile_call 'deno' $rest
 }}
 function pytest {{
   $rest = @(_kds_restore_args $args $MyInvocation.Statement)
-  _kds_wrap 'pytest' $rest
+  _kds_profile_call 'pytest' $rest
 }}
 function python {{
   $rest = @(_kds_restore_args $args $MyInvocation.Statement)
-  if ($rest.Count -ge 2 -and $rest[0] -eq '-m' -and (_kds_safe_python_module $rest[1])) {{ _kds_wrap 'python' $rest }} else {{ _kds_call_native 'python' $rest }}
+  _kds_profile_call 'python' $rest
+}}
+function py {{
+  $rest = @(_kds_restore_args $args $MyInvocation.Statement)
+  _kds_profile_call 'py' $rest
 }}
 function tsc {{
   $rest = @(_kds_restore_args $args $MyInvocation.Statement)
-  _kds_wrap 'tsc' $rest
+  _kds_profile_call 'tsc' $rest
 }}
 function vue-tsc {{
   $rest = @(_kds_restore_args $args $MyInvocation.Statement)
-  _kds_wrap 'vue-tsc' $rest
+  _kds_profile_call 'vue-tsc' $rest
 }}
 function eslint {{
   $rest = @(_kds_restore_args $args $MyInvocation.Statement)
-  _kds_wrap 'eslint' $rest
+  _kds_profile_call 'eslint' $rest
 }}
 function biome {{
   $rest = @(_kds_restore_args $args $MyInvocation.Statement)
-  if ($rest.Count -gt 0 -and @('check','ci','lint') -contains $rest[0]) {{ _kds_wrap 'biome' $rest }} else {{ _kds_call_native 'biome' $rest }}
+  _kds_profile_call 'biome' $rest
 }}
 function prettier {{
   $rest = @(_kds_restore_args $args $MyInvocation.Statement)
-  $hasCheck = _kds_has_flag $rest @('--check','-c')
-  if ($hasCheck) {{ _kds_wrap 'prettier' $rest }} else {{ _kds_call_native 'prettier' $rest }}
+  _kds_profile_call 'prettier' $rest
 }}
 function vitest {{
   $rest = @(_kds_restore_args $args $MyInvocation.Statement)
-  _kds_wrap 'vitest' $rest
+  _kds_profile_call 'vitest' $rest
 }}
 function jest {{
   $rest = @(_kds_restore_args $args $MyInvocation.Statement)
-  _kds_wrap 'jest' $rest
+  _kds_profile_call 'jest' $rest
 }}
 function playwright {{
   $rest = @(_kds_restore_args $args $MyInvocation.Statement)
-  if ($rest.Count -gt 0 -and $rest[0] -eq 'test') {{ _kds_wrap 'playwright' $rest }} else {{ _kds_call_native 'playwright' $rest }}
+  _kds_profile_call 'playwright' $rest
 }}
 function ruff {{
   $rest = @(_kds_restore_args $args $MyInvocation.Statement)
-  $hasCheck = _kds_has_flag $rest @('--check')
-  if ($rest.Count -gt 0 -and ($rest[0] -eq 'check' -or ($rest[0] -eq 'format' -and $hasCheck))) {{ _kds_wrap 'ruff' $rest }} else {{ _kds_call_native 'ruff' $rest }}
+  _kds_profile_call 'ruff' $rest
 }}
 function mypy {{
   $rest = @(_kds_restore_args $args $MyInvocation.Statement)
-  _kds_wrap 'mypy' $rest
+  _kds_profile_call 'mypy' $rest
 }}
 function pyright {{
   $rest = @(_kds_restore_args $args $MyInvocation.Statement)
-  _kds_wrap 'pyright' $rest
+  _kds_profile_call 'pyright' $rest
 }}
 function uv {{
   $rest = @(_kds_restore_args $args $MyInvocation.Statement)
-  if ($rest.Count -ge 2 -and $rest[0] -eq 'run' -and (_kds_safe_python_module $rest[1])) {{ _kds_wrap 'uv' $rest }} else {{ _kds_call_native 'uv' $rest }}
+  _kds_profile_call 'uv' $rest
 }}
 function dotnet {{
   $rest = @(_kds_restore_args $args $MyInvocation.Statement)
-  if ($rest.Count -gt 0 -and @('test','build') -contains $rest[0]) {{ _kds_wrap 'dotnet' $rest }} else {{ _kds_call_native 'dotnet' $rest }}
+  _kds_profile_call 'dotnet' $rest
 }}
 function go {{
   $rest = @(_kds_restore_args $args $MyInvocation.Statement)
-  if ($rest.Count -gt 0 -and @('test','build') -contains $rest[0]) {{ _kds_wrap 'go' $rest }} else {{ _kds_call_native 'go' $rest }}
+  _kds_profile_call 'go' $rest
+}}
+function mvn {{
+  $rest = @(_kds_restore_args $args $MyInvocation.Statement)
+  _kds_profile_call 'mvn' $rest
+}}
+function mvnw {{
+  $rest = @(_kds_restore_args $args $MyInvocation.Statement)
+  _kds_profile_call 'mvnw' $rest
+}}
+function maven {{
+  $rest = @(_kds_restore_args $args $MyInvocation.Statement)
+  _kds_profile_call 'maven' $rest
+}}
+function gradle {{
+  $rest = @(_kds_restore_args $args $MyInvocation.Statement)
+  _kds_profile_call 'gradle' $rest
+}}
+function gradlew {{
+  $rest = @(_kds_restore_args $args $MyInvocation.Statement)
+  _kds_profile_call 'gradlew' $rest
+}}
+function composer {{
+  $rest = @(_kds_restore_args $args $MyInvocation.Statement)
+  _kds_profile_call 'composer' $rest
+}}
+function phpunit {{
+  $rest = @(_kds_restore_args $args $MyInvocation.Statement)
+  _kds_profile_call 'phpunit' $rest
+}}
+function bundle {{
+  $rest = @(_kds_restore_args $args $MyInvocation.Statement)
+  _kds_profile_call 'bundle' $rest
+}}
+function rails {{
+  $rest = @(_kds_restore_args $args $MyInvocation.Statement)
+  _kds_profile_call 'rails' $rest
+}}
+function rspec {{
+  $rest = @(_kds_restore_args $args $MyInvocation.Statement)
+  _kds_profile_call 'rspec' $rest
+}}
+function mix {{
+  $rest = @(_kds_restore_args $args $MyInvocation.Statement)
+  _kds_profile_call 'mix' $rest
+}}
+function cmake {{
+  $rest = @(_kds_restore_args $args $MyInvocation.Statement)
+  _kds_profile_call 'cmake' $rest
+}}
+function make {{
+  $rest = @(_kds_restore_args $args $MyInvocation.Statement)
+  _kds_profile_call 'make' $rest
+}}
+function ninja {{
+  $rest = @(_kds_restore_args $args $MyInvocation.Statement)
+  _kds_profile_call 'ninja' $rest
+}}
+function ctest {{
+  $rest = @(_kds_restore_args $args $MyInvocation.Statement)
+  _kds_profile_call 'ctest' $rest
+}}
+function task {{
+  $rest = @(_kds_restore_args $args $MyInvocation.Statement)
+  _kds_profile_call 'task' $rest
+}}
+function mise {{
+  $rest = @(_kds_restore_args $args $MyInvocation.Statement)
+  _kds_profile_call 'mise' $rest
 }}
 {END}
 "#
@@ -346,6 +508,17 @@ mod tests {
     use std::io::Write;
     use std::process::Command;
 
+    fn assert_sequence(stdout: &str, sequence: &[&str]) {
+        let crlf = sequence.join("\r\n");
+        let lf = sequence.join("\n");
+        assert!(
+            stdout.contains(&crlf) || stdout.contains(&lf),
+            "missing sequence {:?}\nstdout:\n{}",
+            sequence,
+            stdout
+        );
+    }
+
     #[test]
     fn hook_block_is_managed_and_removable() {
         let block = "# kds-hook-start\nx\n# kds-hook-end\n";
@@ -363,7 +536,7 @@ mod tests {
         let block = hook_block().unwrap();
         assert!(block.contains("function KDS {"), "block:\n{block}");
         assert!(
-            block.contains("$kdsCommands = @('run','raw','summarize','gain','gc','prune','doctor','logs','evidence','init','hook','help')"),
+            block.contains("$kdsCommands = @('run','raw','summarize','gain','clean','doctor','logs','evidence','init','hook','help')"),
             "block:\n{block}"
         );
         assert!(
@@ -683,6 +856,137 @@ python scripts/test_publish_local_codex.py
                 || stdout.contains("python-script\nnative:[scripts/test_publish_local_codex.py]"),
             "stdout:\n{stdout}"
         );
+    }
+
+    #[test]
+    fn powershell_hook_wraps_builtin_profiles() {
+        if !cfg!(windows) {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let fake_kds = dir.path().join("kds.cmd");
+        std::fs::write(
+            &fake_kds,
+            "@echo off\r\n:loop\r\nif \"%~1\"==\"\" goto end\r\necho kds:[%~1]\r\nshift\r\ngoto loop\r\n:end\r\n",
+        )
+        .unwrap();
+        for name in [
+            "yarn", "bun", "deno", "go", "mvn", "gradle", "dotnet", "composer", "phpunit",
+            "bundle", "rails", "mix", "cmake", "make", "ninja", "ctest", "task", "mise", "jest",
+        ] {
+            std::fs::write(
+                dir.path().join(format!("{name}.cmd")),
+                "@echo off\r\necho native-%~n0:[%*]\r\n",
+            )
+            .unwrap();
+        }
+
+        let script_path = dir.path().join("profiles.ps1");
+        let mut script = std::fs::File::create(&script_path).unwrap();
+        write!(
+            script,
+            r#"
+{}
+$env:PATH = '{};' + $env:PATH
+$global:KdsExe = '{}'
+$global:KdsCommand = 'kds.cmd'
+"yarn-test"
+yarn test
+"bun-run-lint"
+bun run lint
+"deno-task-test"
+deno task test
+"go-vet"
+go vet ./...
+"mvn-test"
+mvn test
+"gradle-check"
+gradle check
+"dotnet-build"
+dotnet build
+"composer-test"
+composer test
+"phpunit-direct"
+phpunit
+"bundle-rspec"
+bundle exec rspec
+"rails-test"
+rails test
+"mix-compile"
+mix compile
+"cmake-build"
+cmake --build build
+"make-test"
+make test
+"ninja-test"
+ninja test
+"ctest-direct"
+ctest
+"task-test"
+task test
+"mise-run-test"
+mise run test
+"jest-watch-native"
+jest --watch
+"make-deploy-native"
+make deploy
+"mvn-deploy-native"
+mvn deploy
+"done"
+"#,
+            hook_block().unwrap(),
+            dir.path().display(),
+            fake_kds.display()
+        )
+        .unwrap();
+        drop(script);
+
+        let output = match Command::new("pwsh")
+            .arg("-NoProfile")
+            .arg("-ExecutionPolicy")
+            .arg("Bypass")
+            .arg("-File")
+            .arg(&script_path)
+            .output()
+        {
+            Ok(output) => output,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+            Err(err) => panic!("run pwsh: {err}"),
+        };
+
+        assert!(
+            output.status.success(),
+            "stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for (marker, command) in [
+            ("yarn-test", "yarn"),
+            ("bun-run-lint", "bun"),
+            ("deno-task-test", "deno"),
+            ("go-vet", "go"),
+            ("mvn-test", "mvn"),
+            ("gradle-check", "gradle"),
+            ("dotnet-build", "dotnet"),
+            ("composer-test", "composer"),
+            ("phpunit-direct", "phpunit"),
+            ("bundle-rspec", "bundle"),
+            ("rails-test", "rails"),
+            ("mix-compile", "mix"),
+            ("cmake-build", "cmake"),
+            ("make-test", "make"),
+            ("ninja-test", "ninja"),
+            ("ctest-direct", "ctest"),
+            ("task-test", "task"),
+            ("mise-run-test", "mise"),
+        ] {
+            assert_sequence(&stdout, &[marker, "kds:[--]", &format!("kds:[{command}]")]);
+        }
+        assert_sequence(&stdout, &["jest-watch-native", "native-jest:[--watch]"]);
+        assert_sequence(&stdout, &["make-deploy-native", "native-make:[deploy]"]);
+        assert_sequence(&stdout, &["mvn-deploy-native", "native-mvn:[deploy]"]);
     }
 
     #[test]

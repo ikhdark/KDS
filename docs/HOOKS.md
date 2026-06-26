@@ -45,26 +45,30 @@ proof-line commands through KDS when their output is the deliverable, including
 `git status`, `git diff --name-only`, `git diff --check`, tracked diff hash
 commands, and publish/install proof-line extraction.
 
-For package scripts and `just`, the automatic hook wraps common verification
-tasks only: `test`, `build`, `check`, `lint`, `typecheck`, `ci`, and `clippy`.
-Hyphenated variants of those task names, such as `test-fast`, are treated as
-the same verification family. Other script or recipe names run natively because
-they may deploy, prompt, or print sensitive operational output.
+The hook ships built-in profiles for noisy verification ecosystems. Profiles
+match command categories such as `test`, `build`, `check`, `lint`, `typecheck`,
+`format-check`, `ci`, `clippy`, `vet`, and `compile`, including hyphenated
+variants such as `test-fast`. Other task names run natively because they may
+deploy, prompt, or print sensitive operational output.
 
-For TypeScript and JavaScript, the automatic hook wraps common bounded
-verification commands: `tsc`, `vue-tsc`, `eslint`, `vitest`, `jest`,
-`playwright test`, `biome check`, `biome ci`, `biome lint`, and
-`prettier --check`.
+Built-in JavaScript and TypeScript profiles include `npm`, `pnpm`, `yarn`,
+`bun`, `deno`, `jest`, `vitest`, `tsc`, `vue-tsc`, `eslint`, `biome`,
+`prettier --check`, and `playwright test`. Watch/dev/UI forms run natively
+where the profile can identify them.
 
-For Python, the automatic hook wraps test and static-analysis runners:
-`pytest`, `python -m pytest`, `python -m unittest`, `python -m ruff`,
-`python -m mypy`, `python -m pyright`, `ruff check`, `ruff format --check`,
-`mypy`, `pyright`, and matching `uv run ...` forms. Other `python ...`
-commands run natively because they may be interactive, long-running, or print
-sensitive operational output.
+Built-in Python profiles include `pytest`, `python -m pytest`,
+`python -m unittest`, `python -m ruff`, `python -m mypy`,
+`python -m pyright`, `ruff check`, `ruff format --check`, `mypy`, `pyright`,
+and matching `uv run ...` forms. Other `python ...` commands run natively
+because they may be interactive, long-running, or print sensitive operational
+output.
 
-For .NET and Go, the automatic hook wraps bounded build and test commands:
-`dotnet build`, `dotnet test`, `go build`, and `go test`.
+Built-in Go, Java/Kotlin, .NET, PHP, Ruby, Elixir, C/C++, and task-runner
+profiles include `go test`, `go build`, `go vet`, Maven/Gradle test/build/check
+goals, `dotnet test`, `dotnet build`, Composer safe scripts, `phpunit`,
+`bundle exec rspec`, `rails test`, `mix test`, `mix compile`, `cmake --build`,
+safe `make` and `ninja` targets, `ctest`, `just`, `task`, `mise run`, and safe
+package scripts.
 
 The Codex Desktop hook parses matched shell commands into PowerShell argv tokens
 and rewrites only commands it can prove are simple argv-equivalent allowlist

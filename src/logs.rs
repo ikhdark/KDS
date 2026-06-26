@@ -1,18 +1,18 @@
 use anyhow::Result;
 use std::path::Path;
 
-use crate::cli::{LogsCommand, LogsShowArgs};
+use crate::cli::LogsArgs;
 use crate::storage;
 use crate::summarize;
 
-pub fn run(command: LogsCommand) -> Result<i32> {
+pub fn run(args: LogsArgs) -> Result<i32> {
     let paths = storage::Paths::discover()?;
-    match command {
-        LogsCommand::Dir => {
+    match resolve_request(args)? {
+        LogsRequest::Dir => {
             println!("{}", paths.logs_dir.display());
             Ok(0)
         }
-        LogsCommand::Stats => {
+        LogsRequest::Stats { show_paths } => {
             let stats = storage::log_stats(&paths)?;
             println!("KDS logs stats");
             println!("Runs indexed: {}", stats.indexed_runs);
@@ -31,30 +31,91 @@ pub fn run(command: LogsCommand) -> Result<i32> {
                 "Newest run: {}",
                 stats.newest_run.unwrap_or_else(|| "none".to_string())
             );
-            println!("Logs directory: use `kds logs dir`");
+            if show_paths {
+                println!("Logs directory: {}", paths.logs_dir.display());
+            } else {
+                println!("Logs directory: use `kds logs --show-paths`");
+            }
             Ok(0)
         }
-        LogsCommand::Last(args) => {
-            let entry = storage::last_run(&paths)?;
-            let sidecar = storage::read_sidecar_for_display(Path::new(&entry.summary_path))?;
-            print!(
-                "{}",
-                summarize::format_safe_metadata_with_paths(&sidecar, args.show_paths)
-            );
-            Ok(0)
-        }
-        LogsCommand::Show(args) => show(args),
+        LogsRequest::Run {
+            id,
+            show_paths,
+            section,
+        } => show(&paths, &id, show_paths, section),
     }
 }
 
-fn show(args: LogsShowArgs) -> Result<i32> {
-    let paths = storage::Paths::discover()?;
-    let entry = if args.id == "last" {
-        storage::last_run(&paths)?
-    } else {
-        storage::resolve_run_id(&paths, &args.id)?
-    };
-    let sidecar = storage::read_sidecar_for_display(Path::new(&entry.summary_path))?;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LogsSection {
+    Metadata,
+    Summary,
+    Errors,
+    ErrorWindow,
+    Tail,
+    FileHits,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum LogsRequest {
+    Dir,
+    Stats {
+        show_paths: bool,
+    },
+    Run {
+        id: String,
+        show_paths: bool,
+        section: LogsSection,
+    },
+}
+
+enum Positional {
+    None,
+    Dir,
+    Stats,
+    Run(String),
+}
+
+fn resolve_request(args: LogsArgs) -> Result<LogsRequest> {
+    let section = section_from_flags(&args)?;
+    let positional = positional_request(args.target)?;
+    let section_requested = section != LogsSection::Metadata;
+
+    if matches!(positional, Positional::Dir) {
+        if args.show_paths || section_requested {
+            anyhow::bail!("choose only one logs action");
+        }
+        return Ok(LogsRequest::Dir);
+    }
+
+    if matches!(positional, Positional::Stats) {
+        return Ok(LogsRequest::Stats {
+            show_paths: args.show_paths,
+        });
+    }
+
+    if let Positional::Run(id) = positional {
+        return Ok(LogsRequest::Run {
+            id,
+            show_paths: args.show_paths,
+            section,
+        });
+    }
+
+    if section_requested {
+        return Ok(LogsRequest::Run {
+            id: "last".to_string(),
+            show_paths: args.show_paths,
+            section,
+        });
+    }
+
+    Ok(LogsRequest::Stats {
+        show_paths: args.show_paths,
+    })
+}
+
+fn section_from_flags(args: &LogsArgs) -> Result<LogsSection> {
     let sections = [
         args.summary,
         args.errors,
@@ -66,37 +127,75 @@ fn show(args: LogsShowArgs) -> Result<i32> {
     .filter(|enabled| **enabled)
     .count();
     if sections > 1 {
-        anyhow::bail!("choose only one logs show section flag");
+        anyhow::bail!("choose only one logs section flag");
     }
     if args.summary {
+        Ok(LogsSection::Summary)
+    } else if args.errors {
+        Ok(LogsSection::Errors)
+    } else if args.error_window {
+        Ok(LogsSection::ErrorWindow)
+    } else if args.tail {
+        Ok(LogsSection::Tail)
+    } else if args.file_hits {
+        Ok(LogsSection::FileHits)
+    } else {
+        Ok(LogsSection::Metadata)
+    }
+}
+
+fn positional_request(tokens: Vec<String>) -> Result<Positional> {
+    match tokens.as_slice() {
+        [] => Ok(Positional::None),
+        [token] if token == "dir" => Ok(Positional::Dir),
+        [token] if token == "stats" => Ok(Positional::Stats),
+        [token] if token == "show" => {
+            anyhow::bail!("missing run id after `show`; use `kds logs last` or `kds logs <run-id>`")
+        }
+        [id] => Ok(Positional::Run(id.clone())),
+        [command, id] if command == "show" => Ok(Positional::Run(id.clone())),
+        _ => anyhow::bail!(
+            "unrecognized logs arguments; use `kds logs [RUN_ID|last] [--errors|--error-window]`"
+        ),
+    }
+}
+
+fn show(paths: &storage::Paths, id: &str, show_paths: bool, section: LogsSection) -> Result<i32> {
+    let entry = if id == "last" {
+        storage::last_run(paths)?
+    } else {
+        storage::resolve_run_id(paths, id)?
+    };
+    let sidecar = storage::read_sidecar_for_display(Path::new(&entry.summary_path))?;
+    if section == LogsSection::Summary {
         print!(
             "{}",
-            summarize::format_compact_with_paths(&sidecar, args.show_paths)
+            summarize::format_compact_with_paths(&sidecar, show_paths)
         );
-    } else if args.errors {
+    } else if section == LogsSection::Errors {
         print_section(
             "Top errors",
-            &summarize::display_items_for_paths(&sidecar, &sidecar.top_errors, args.show_paths),
+            &summarize::display_items_for_paths(&sidecar, &sidecar.top_errors, show_paths),
             8,
         );
-    } else if args.error_window {
-        print_error_windows(&sidecar, args.show_paths);
-    } else if args.tail {
+    } else if section == LogsSection::ErrorWindow {
+        print_error_windows(&sidecar, show_paths);
+    } else if section == LogsSection::Tail {
         print_section(
             "Final tail",
-            &summarize::display_items_for_paths(&sidecar, &sidecar.tail, args.show_paths),
+            &summarize::display_items_for_paths(&sidecar, &sidecar.tail, show_paths),
             40,
         );
-    } else if args.file_hits {
+    } else if section == LogsSection::FileHits {
         print_section(
             "File hits",
-            &summarize::display_items_for_paths(&sidecar, &sidecar.file_hits, args.show_paths),
+            &summarize::display_items_for_paths(&sidecar, &sidecar.file_hits, show_paths),
             10,
         );
     } else {
         print!(
             "{}",
-            summarize::format_safe_metadata_with_paths(&sidecar, args.show_paths)
+            summarize::format_safe_metadata_with_paths(&sidecar, show_paths)
         );
     }
     Ok(0)

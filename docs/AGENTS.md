@@ -23,11 +23,13 @@ Scope: `docs/`.
 - Document `--show-paths` as the explicit opt-in for local paths.
 - Preserve V1 constraints: no telemetry, no stored raw-log display command, no
   runtime network calls, and PowerShell-only automatic activation.
+- State that KDS does not download or install Rust/Cargo; source-based install
+  requires Cargo to already be available on PATH.
 - Use the wording "same failure signal" for repeated-failure behavior.
 - Keep install docs automatic-hook-first: supported Windows install means
   binary plus allowlisted PowerShell/Codex hook setup.
-- Document `gc` and `prune` as KDS-artifact cleanup commands that must stay
-  limited to KDS-owned runtime artifacts.
+- Document `clean` as the KDS-artifact cleanup command that must stay limited
+  to KDS-owned runtime artifacts.
 
 ## Change Coupling
 

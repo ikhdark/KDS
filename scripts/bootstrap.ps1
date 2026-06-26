@@ -49,6 +49,8 @@ Copy-paste install:
 Behavior:
   - downloads the versioned KDS release source archive
   - verifies the archive SHA-256 checksum from the matching release asset
+  - requires Rust/Cargo to already be available on PATH
+  - never downloads or installs Rust/Cargo
   - builds KDS with cargo
   - runs scripts/install.ps1 from the downloaded source
 "@ | Write-Host
@@ -61,13 +63,13 @@ Write-Host "Source archive: $archiveUrl"
 Write-Host "Checksum: $checksumUrl"
 
 if ($DryRun) {
-  Write-Host "Dry run: no download, no checksum verification, no extraction, no build, no install."
+  Write-Host "Dry run: no download, no checksum verification, no extraction, no Rust/Cargo install, no build, no install."
   exit 0
 }
 
 $cargo = Get-Command cargo -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
 if (-not $cargo) {
-  Write-Error "Cargo was not found on PATH. Install Rust/Cargo, then rerun the KDS install command."
+  Write-Error "Cargo was not found on PATH. KDS does not download or install Rust/Cargo. Install Rust/Cargo separately, then rerun the KDS install command."
   exit 1
 }
 

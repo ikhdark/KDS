@@ -8,7 +8,6 @@ use std::sync::{mpsc, Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::cli::SummaryBudget;
 use crate::digest;
 use crate::storage::{
     self, IndexEntry, Paths, RepeatStatus, RunPaths, SummarySidecar, INDEX_SCHEMA_VERSION,
@@ -17,6 +16,7 @@ use crate::storage::{
 use crate::summarize;
 
 const DEFAULT_RAW_BYTE_LIMIT: u64 = 10 * 1024 * 1024;
+const DEFAULT_SUMMARY_BUDGET: &str = "normal";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -33,13 +33,7 @@ impl Mode {
     }
 }
 
-pub fn run(
-    argv: Vec<String>,
-    mode: Mode,
-    show_paths: bool,
-    budget: Option<SummaryBudget>,
-    save_artifacts: bool,
-) -> Result<i32> {
+pub fn run(argv: Vec<String>, mode: Mode, show_paths: bool, save_artifacts: bool) -> Result<i32> {
     if argv.is_empty() {
         eprintln!("kds: no wrapped command provided");
         return Ok(2);
@@ -50,7 +44,7 @@ pub fn run(
     }
 
     if !artifacts_enabled(save_artifacts) {
-        return run_memory_only(argv, mode, show_paths, budget);
+        return run_memory_only(argv, mode, show_paths);
     }
 
     let cwd = std::env::current_dir()?;
@@ -98,7 +92,6 @@ pub fn run(
                 elapsed_duration: begin.elapsed(),
                 failure: &failure,
                 raw_byte_limit,
-                budget,
             });
             return Ok(1);
         }
@@ -285,7 +278,7 @@ pub fn run(
         previous_exact_match_run: previous_match,
         started_at: started.to_rfc3339(),
         command_kind: command_kind.clone(),
-        summary_budget: budget_label(budget).to_string(),
+        summary_budget: DEFAULT_SUMMARY_BUDGET.to_string(),
         capture_mode: "stdout/stderr piped to local temp files".to_string(),
         spawn_error: None,
         runtime_warnings,
@@ -312,7 +305,6 @@ pub fn run(
         command_identity: &safe_command_identity,
         cwd: &cwd_string,
         show_paths,
-        budget,
     });
 
     if mode == Mode::Compact {
@@ -322,12 +314,7 @@ pub fn run(
     Ok(exit_code)
 }
 
-fn run_memory_only(
-    argv: Vec<String>,
-    mode: Mode,
-    show_paths: bool,
-    budget: Option<SummaryBudget>,
-) -> Result<i32> {
+fn run_memory_only(argv: Vec<String>, mode: Mode, show_paths: bool) -> Result<i32> {
     let cwd = std::env::current_dir()?;
     let started = Local::now();
     let command = storage::command_string(&argv);
@@ -385,11 +372,10 @@ fn run_memory_only(
                 raw_stderr_chars: failure.chars().count(),
                 started_at: started.to_rfc3339(),
                 command_kind,
-                budget,
                 capture_mode: "memory-only; artifacts disabled".to_string(),
                 spawn_error: Some(failure),
             });
-            let display = finalize_sidecar_counts(&mut sidecar, show_paths, budget);
+            let display = finalize_sidecar_counts(&mut sidecar, show_paths);
             if mode == Mode::Compact {
                 print!("{display}");
             }
@@ -494,11 +480,10 @@ fn run_memory_only(
         raw_stderr_chars,
         started_at: started.to_rfc3339(),
         command_kind,
-        budget,
         capture_mode: "memory-only; artifacts disabled".to_string(),
         spawn_error: None,
     });
-    let display = finalize_sidecar_counts(&mut sidecar, show_paths, budget);
+    let display = finalize_sidecar_counts(&mut sidecar, show_paths);
 
     if mode == Mode::Compact {
         print!("{display}");
@@ -665,7 +650,7 @@ pub fn summarize_import(args: crate::cli::SummarizeArgs) -> Result<i32> {
         previous_exact_match_run: previous_match,
         started_at: started.to_rfc3339(),
         command_kind: command_kind.clone(),
-        summary_budget: budget_label(args.budget).to_string(),
+        summary_budget: DEFAULT_SUMMARY_BUDGET.to_string(),
         capture_mode: import_capture_mode(args.file.is_some()).to_string(),
         spawn_error: None,
         runtime_warnings,
@@ -692,7 +677,6 @@ pub fn summarize_import(args: crate::cli::SummarizeArgs) -> Result<i32> {
         command_identity: &safe_command_identity,
         cwd: &cwd_string,
         show_paths: args.show_paths,
-        budget: args.budget,
     });
 
     print!("{display}");
@@ -762,11 +746,10 @@ fn summarize_import_memory_only(args: crate::cli::SummarizeArgs) -> Result<i32> 
         raw_stderr_chars,
         started_at: started.to_rfc3339(),
         command_kind,
-        budget: args.budget,
         capture_mode: import_memory_capture_mode(args.file.is_some()).to_string(),
         spawn_error: None,
     });
-    let display = finalize_sidecar_counts(&mut sidecar, args.show_paths, args.budget);
+    let display = finalize_sidecar_counts(&mut sidecar, args.show_paths);
 
     print!("{display}");
     Ok(0)
@@ -805,7 +788,6 @@ struct MemorySidecarInput {
     raw_stderr_chars: usize,
     started_at: String,
     command_kind: String,
-    budget: Option<SummaryBudget>,
     capture_mode: String,
     spawn_error: Option<String>,
 }
@@ -872,7 +854,7 @@ fn memory_sidecar(input: MemorySidecarInput) -> SummarySidecar {
         previous_exact_match_run: None,
         started_at: input.started_at,
         command_kind: input.command_kind,
-        summary_budget: budget_label(input.budget).to_string(),
+        summary_budget: DEFAULT_SUMMARY_BUDGET.to_string(),
         capture_mode: input.capture_mode,
         spawn_error: input.spawn_error,
         runtime_warnings: Vec::new(),
@@ -1128,7 +1110,6 @@ struct SpawnFailureRecord<'a> {
     elapsed_duration: Duration,
     failure: &'a str,
     raw_byte_limit: Option<u64>,
-    budget: Option<SummaryBudget>,
 }
 
 fn record_spawn_failure(record: SpawnFailureRecord<'_>) {
@@ -1219,7 +1200,7 @@ fn record_spawn_failure(record: SpawnFailureRecord<'_>) {
         previous_exact_match_run: None,
         started_at: record.started.to_rfc3339(),
         command_kind: record.command_kind.to_string(),
-        summary_budget: budget_label(record.budget).to_string(),
+        summary_budget: DEFAULT_SUMMARY_BUDGET.to_string(),
         capture_mode: "not started; spawn failed".to_string(),
         spawn_error: Some(failure),
         runtime_warnings,
@@ -1246,7 +1227,6 @@ fn record_spawn_failure(record: SpawnFailureRecord<'_>) {
         command_identity: record.safe_command_identity,
         cwd: &cwd_string,
         show_paths: false,
-        budget: record.budget,
     });
     if record.mode == Mode::Compact {
         print!("{display}");
@@ -1262,7 +1242,6 @@ struct CommitRunState<'a> {
     command_identity: &'a str,
     cwd: &'a str,
     show_paths: bool,
-    budget: Option<SummaryBudget>,
 }
 
 fn commit_run_state(commit: CommitRunState<'_>) -> (SummarySidecar, String) {
@@ -1275,7 +1254,6 @@ fn commit_run_state(commit: CommitRunState<'_>) -> (SummarySidecar, String) {
         command_identity,
         cwd,
         show_paths,
-        budget,
     } = commit;
     let mut display = String::new();
     if let Err(err) = storage::with_state_lock(paths, || {
@@ -1288,7 +1266,7 @@ fn commit_run_state(commit: CommitRunState<'_>) -> (SummarySidecar, String) {
             &run_paths.log_path,
             &run_paths.run_id,
         )?;
-        display = finalize_sidecar_counts(&mut sidecar, show_paths, budget);
+        display = finalize_sidecar_counts(&mut sidecar, show_paths);
         storage::write_sidecar(&run_paths.summary_path, &sidecar)?;
         storage::record_run_state_unlocked(paths, entry, &sidecar)?;
         Ok(())
@@ -1297,18 +1275,14 @@ fn commit_run_state(commit: CommitRunState<'_>) -> (SummarySidecar, String) {
             sidecar.repeat_status.message = "state unavailable".to_string();
         }
         record_runtime_warning(&mut sidecar.runtime_warnings, "state commit failed", &err);
-        display = finalize_sidecar_counts(&mut sidecar, show_paths, budget);
+        display = finalize_sidecar_counts(&mut sidecar, show_paths);
     }
     (sidecar, display)
 }
 
-fn finalize_sidecar_counts(
-    sidecar: &mut SummarySidecar,
-    show_paths: bool,
-    budget: Option<SummaryBudget>,
-) -> String {
+fn finalize_sidecar_counts(sidecar: &mut SummarySidecar, show_paths: bool) -> String {
     for _ in 0..3 {
-        let display = summarize::format_compact_with_budget(sidecar, show_paths, budget);
+        let display = summarize::format_compact_with_paths(sidecar, show_paths);
         let shown_lines = storage::line_count(&display);
         let shown_chars = display.chars().count();
         let changed = sidecar.shown_lines != shown_lines || sidecar.shown_chars != shown_chars;
@@ -1331,7 +1305,7 @@ fn finalize_sidecar_counts(
         }
     }
 
-    summarize::format_compact_with_budget(sidecar, show_paths, budget)
+    summarize::format_compact_with_paths(sidecar, show_paths)
 }
 
 fn placeholder_repeat_status(run_paths: &RunPaths) -> RepeatStatus {
@@ -1347,14 +1321,6 @@ fn placeholder_repeat_status(run_paths: &RunPaths) -> RepeatStatus {
 
 fn approximate_tokens(chars: usize) -> usize {
     chars.div_ceil(4)
-}
-
-fn budget_label(budget: Option<SummaryBudget>) -> &'static str {
-    match budget {
-        Some(SummaryBudget::Tight) => "tight",
-        Some(SummaryBudget::Wide) => "wide",
-        _ => "normal",
-    }
 }
 
 fn record_runtime_warning(warnings: &mut Vec<String>, label: &str, err: &anyhow::Error) {

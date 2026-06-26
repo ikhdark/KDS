@@ -32,6 +32,8 @@ Scope: `scripts/`.
 
 - Keep install automatic-hook-first on Windows.
 - Keep Cargo as the build mechanism. Do not download a prebuilt binary in V1.
+- Do not download or install Rust/Cargo. If Cargo is missing, fail clearly and
+  tell the user to install it separately.
 - Preserve clear failure modes for missing Cargo, failed build, failed install,
   and hook update failures.
 - Keep install output suitable for proof-line extraction when validation needs

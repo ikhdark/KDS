@@ -97,10 +97,7 @@ fn wraps_real_command_and_writes_local_run_artifacts() {
     assert!(stdout.starts_with("KDS\n"), "stdout:\n{stdout}");
     assert!(stdout.contains("Exit code: 0"), "stdout:\n{stdout}");
     assert!(stdout.contains("Summary: success"), "stdout:\n{stdout}");
-    assert!(
-        stdout.contains("Log: use `kds logs show "),
-        "stdout:\n{stdout}"
-    );
+    assert!(stdout.contains("Log: use `kds logs "), "stdout:\n{stdout}");
     assert!(
         !stdout.contains(&kds_home.path().display().to_string()),
         "stdout:\n{stdout}"
@@ -460,7 +457,6 @@ fn logs_show_missing_sidecar_uses_path_safe_error() {
     let output = Command::new(kds_bin())
         .env("KDS_HOME", kds_home.path())
         .arg("logs")
-        .arg("show")
         .arg("a1b2c3")
         .output()
         .unwrap();
@@ -494,7 +490,6 @@ fn logs_stats_reports_safe_artifact_counts() {
     let output = Command::new(kds_bin())
         .env("KDS_HOME", kds_home.path())
         .arg("logs")
-        .arg("stats")
         .output()
         .unwrap();
     assert!(output.status.success(), "{output:?}");
@@ -504,17 +499,30 @@ fn logs_stats_reports_safe_artifact_counts() {
     assert!(stdout.contains("Raw logs: 1"), "stdout:\n{stdout}");
     assert!(stdout.contains("Summary sidecars: 1"), "stdout:\n{stdout}");
     assert!(
-        stdout.contains("Logs directory: use `kds logs dir`"),
+        stdout.contains("Logs directory: use `kds logs --show-paths`"),
         "stdout:\n{stdout}"
     );
     assert!(
         !stdout.contains(&kds_home.path().display().to_string()),
         "stdout:\n{stdout}"
     );
+
+    let dir = Command::new(kds_bin())
+        .env("KDS_HOME", kds_home.path())
+        .arg("logs")
+        .arg("--show-paths")
+        .output()
+        .unwrap();
+    assert!(dir.status.success(), "{dir:?}");
+    let stdout = String::from_utf8_lossy(&dir.stdout);
+    assert!(
+        stdout.contains(&kds_home.path().join("logs").display().to_string()),
+        "stdout:\n{stdout}"
+    );
 }
 
 #[test]
-fn gc_removes_old_artifacts_under_logs_only() {
+fn clean_removes_old_artifacts_under_logs_only() {
     let kds_home = tempfile::tempdir().unwrap();
     let day = kds_home.path().join("logs").join("2026-01-01");
     fs::create_dir_all(&day).unwrap();
@@ -526,56 +534,20 @@ fn gc_removes_old_artifacts_under_logs_only() {
     fs::write(&keep, "not a kds artifact").unwrap();
     thread::sleep(Duration::from_millis(1500));
 
-    let dry_run = Command::new(kds_bin())
-        .env("KDS_HOME", kds_home.path())
-        .arg("gc")
-        .arg("--older-than")
-        .arg("1s")
-        .arg("--dry-run")
-        .output()
-        .unwrap();
-    assert!(dry_run.status.success(), "{dry_run:?}");
-    let stdout = String::from_utf8_lossy(&dry_run.stdout);
-    assert!(stdout.contains("Mode: dry run"), "stdout:\n{stdout}");
-    assert!(stdout.contains("Artifacts matched: 2"), "stdout:\n{stdout}");
-    assert!(log.exists());
-    assert!(summary.exists());
-
     let delete = Command::new(kds_bin())
         .env("KDS_HOME", kds_home.path())
-        .arg("gc")
+        .arg("clean")
         .arg("--older-than")
         .arg("1s")
         .output()
         .unwrap();
     assert!(delete.status.success(), "{delete:?}");
     let stdout = String::from_utf8_lossy(&delete.stdout);
+    assert!(stdout.contains("KDS clean"), "stdout:\n{stdout}");
     assert!(stdout.contains("Deleted: 2"), "stdout:\n{stdout}");
     assert!(!log.exists());
     assert!(!summary.exists());
     assert!(keep.exists());
-}
-
-#[test]
-fn prune_alias_removes_old_artifacts_under_logs_only() {
-    let kds_home = tempfile::tempdir().unwrap();
-    let day = kds_home.path().join("logs").join("2026-01-01");
-    fs::create_dir_all(&day).unwrap();
-    let log = day.join("old.log");
-    fs::write(&log, "old log").unwrap();
-    thread::sleep(Duration::from_millis(1500));
-
-    let output = Command::new(kds_bin())
-        .env("KDS_HOME", kds_home.path())
-        .arg("prune")
-        .arg("--before")
-        .arg("1s")
-        .output()
-        .unwrap();
-    assert!(output.status.success(), "{output:?}");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("KDS prune"), "stdout:\n{stdout}");
-    assert!(!log.exists());
 }
 
 #[test]
@@ -599,7 +571,6 @@ fn logs_show_error_window_prints_bounded_context() {
     let show = Command::new(kds_bin())
         .env("KDS_HOME", kds_home.path())
         .arg("logs")
-        .arg("show")
         .arg(run_id)
         .arg("--error-window")
         .output()
@@ -612,8 +583,6 @@ fn logs_show_error_window_prints_bounded_context() {
     let show_last = Command::new(kds_bin())
         .env("KDS_HOME", kds_home.path())
         .arg("logs")
-        .arg("show")
-        .arg("last")
         .arg("--error-window")
         .output()
         .unwrap();

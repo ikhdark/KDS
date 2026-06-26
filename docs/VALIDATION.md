@@ -11,12 +11,10 @@ cargo run -- --help
 cargo run -- --version
 cargo run -- gain
 cargo run -- doctor
-cargo run -- logs dir
-cargo run -- logs stats
-cargo run -- gc --older-than 30d --dry-run
-cargo run -- prune --before 30d --dry-run
+cargo run -- logs
+cargo run -- logs --show-paths
+cargo run -- clean --older-than 30d
 cargo run -- -- node --version
-cargo run -- run --budget tight -- node --version
 cargo run -- raw -- node --version
 "error: synthetic failure" | cargo run -- summarize --name synthetic-ci --exit-code 1
 cargo run -- summarize --file .\README.md --name readme-log --exit-code 0
@@ -40,7 +38,14 @@ no mutation of real global config during tests.
 
 Bootstrap dry-run should print the versioned release source archive and checksum
 URL without downloading either file. Installer dry-run should avoid file writes,
-PATH edits, builds, profile edits, and Codex Desktop hook edits.
+PATH edits, builds, Rust/Cargo installation, profile edits, and Codex Desktop
+hook edits. With Cargo absent from PATH, bootstrap and installer flows should
+fail clearly before any source download or build attempt.
+
+Hook profile validation should cover both the managed PowerShell hook and Codex
+Desktop hook matcher. Verify built-in profiles for JavaScript/TypeScript,
+Python, Go, Java/Kotlin, .NET, PHP, Ruby, Elixir, C/C++, and task runners, plus
+native passthrough for deploy/publish/watch/dev-style commands.
 
 To validate corrupt-state resilience, write a malformed line to a temp
 `state/runs.jsonl` and run `kds doctor`. Doctor should report the malformed
@@ -55,12 +60,10 @@ a raw log, sidecar, and index entry; parallel saved wrapped commands append
 valid `runs.jsonl` lines; and stale `*.tmp` files under the KDS logs tree are
 cleaned up only after they are old enough to be considered abandoned.
 
-To validate summary behavior, run a failing command with `--budget tight`,
-`--budget normal`, and `--budget wide`; run the same failure twice and confirm
-default output says artifacts were not saved. For saved-artifact repeat tracking
-and drilldown validation, run the same failure twice with `--save-artifacts`;
-then check `kds logs show <id> --error-window` and
-`kds logs show last --error-window`.
+To validate summary behavior, run a failing command twice and confirm default
+output says artifacts were not saved. For saved-artifact repeat tracking and
+drilldown validation, run the same failure twice with `--save-artifacts`; then
+check `kds logs <id> --error-window` and `kds logs last --error-window`.
 Raw mode should tee command output live while staying memory-only by default.
 Set `KDS_SAVE_ARTIFACTS=1` and `KDS_MAX_RAW_BYTES=5` for a temp `KDS_HOME` run
 and verify the raw log contains a truncation note and the sidecar records
@@ -81,10 +84,8 @@ To validate exact-output passthrough, run proof-style Git commands through
 Git output and should not create KDS artifacts.
 
 To validate retention, create old `.log` and `.summary.json` files under a temp
-KDS logs directory, run `kds gc --older-than 30d --dry-run` and
-`kds prune --before 30d --dry-run`, then run the same command without
-`--dry-run`. KDS should only remove KDS artifacts under the logs tree and should
-reconcile state by removing index entries whose sidecars are gone, rebuilding
-`latest-by-command`, and retiring digest shards that point to removed raw logs.
-Also validate `KDS_RETENTION_DAYS` and `KDS_MAX_TOTAL_LOG_BYTES` against temp
-storage.
+KDS logs directory, then run `kds clean --older-than 30d`. KDS should only remove
+KDS artifacts under the logs tree and should reconcile state by removing index
+entries whose sidecars are gone, rebuilding `latest-by-command`, and retiring
+digest shards that point to removed raw logs. Also validate `KDS_RETENTION_DAYS`
+and `KDS_MAX_TOTAL_LOG_BYTES` against temp storage.

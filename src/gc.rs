@@ -1,70 +1,36 @@
 use anyhow::{bail, Result};
 use std::time::Duration;
 
-use crate::cli::{GcArgs, PruneArgs};
+use crate::cli::CleanArgs;
 use crate::storage;
 
-pub fn run(args: GcArgs) -> Result<i32> {
+pub fn run(args: CleanArgs) -> Result<i32> {
     let older_than = parse_age(&args.older_than)?;
     let paths = storage::Paths::discover()?;
-    let report = storage::gc_artifacts(&paths, older_than, args.dry_run)?;
-    let state_report = if should_reconcile_state(&paths, &report, args.dry_run) {
+    let report = storage::gc_artifacts(&paths, older_than, false)?;
+    let state_report = if should_reconcile_state(&paths, &report) {
         Some(storage::reconcile_state_after_artifact_cleanup(&paths)?)
     } else {
         None
     };
 
-    println!("KDS gc");
+    println!("KDS clean");
     println!("Older than: {}", args.older_than);
-    println!("Mode: {}", if args.dry_run { "dry run" } else { "delete" });
+    println!("Mode: delete");
     println!("Artifacts matched: {}", report.matched_artifacts);
     println!("Bytes matched: {}", format_bytes(report.matched_bytes));
-    if args.dry_run {
-        println!("Deleted: 0");
-    } else {
-        println!("Deleted: {}", report.deleted_artifacts);
-        println!("Bytes deleted: {}", format_bytes(report.deleted_bytes));
-        print_state_reconciliation(state_report.as_ref());
-    }
+    println!("Deleted: {}", report.deleted_artifacts);
+    println!("Bytes deleted: {}", format_bytes(report.deleted_bytes));
+    print_state_reconciliation(state_report.as_ref());
     Ok(0)
 }
 
-pub fn run_prune(args: PruneArgs) -> Result<i32> {
-    let older_than = parse_age(&args.before)?;
-    let paths = storage::Paths::discover()?;
-    let report = storage::gc_artifacts(&paths, older_than, args.dry_run)?;
-    let state_report = if should_reconcile_state(&paths, &report, args.dry_run) {
-        Some(storage::reconcile_state_after_artifact_cleanup(&paths)?)
-    } else {
-        None
-    };
-
-    println!("KDS prune");
-    println!("Before: {}", args.before);
-    println!("Mode: {}", if args.dry_run { "dry run" } else { "delete" });
-    println!("Artifacts matched: {}", report.matched_artifacts);
-    println!("Bytes matched: {}", format_bytes(report.matched_bytes));
-    if args.dry_run {
-        println!("Deleted: 0");
-    } else {
-        println!("Deleted: {}", report.deleted_artifacts);
-        println!("Bytes deleted: {}", format_bytes(report.deleted_bytes));
-        print_state_reconciliation(state_report.as_ref());
-    }
-    Ok(0)
-}
-
-fn should_reconcile_state(
-    paths: &storage::Paths,
-    report: &storage::GcReport,
-    dry_run: bool,
-) -> bool {
-    !dry_run
-        && (report.deleted_artifacts > 0
-            || paths.runs_index.exists()
-            || paths.latest_by_command.exists()
-            || paths.digest_dir.exists()
-            || paths.state_dir.join("unresolved-by-command").exists())
+fn should_reconcile_state(paths: &storage::Paths, report: &storage::GcReport) -> bool {
+    report.deleted_artifacts > 0
+        || paths.runs_index.exists()
+        || paths.latest_by_command.exists()
+        || paths.digest_dir.exists()
+        || paths.state_dir.join("unresolved-by-command").exists()
 }
 
 fn print_state_reconciliation(report: Option<&storage::StateReconciliationReport>) {

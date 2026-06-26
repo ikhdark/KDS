@@ -146,14 +146,11 @@ fn backup_existing(path: &PathBuf) -> Result<Option<PathBuf>> {
 fn kds_guidance() -> String {
     r#"# KDS Usage
 
-Use KDS for noisy non-interactive build and test commands. Prefer explicit
-forms when hooks are unavailable:
+Use KDS for non-interactive build and test commands that spam logs. Prefer
+explicit forms when hooks are unavailable:
 
-- `kds -- cargo test`
-- `kds -- just ...`
-- `kds -- npm test`
-- `kds -- pnpm test`
-- `kds -- pytest`
+- `kds -- <verification command>`
+- `kds raw -- <verification command>`
 - `kds summarize --file ci.log --name github-actions`
 
 Do not use KDS when exact output lines are the deliverable. Run readiness and
@@ -206,7 +203,7 @@ mod tests {
     fn generated_guidance_keeps_exact_readiness_evidence_native() {
         let guidance = kds_guidance();
         for expected in [
-            "noisy non-interactive build and test commands",
+            "non-interactive build and test commands that spam logs",
             "Do not use KDS when exact output lines are the deliverable",
             "`git status`",
             "`git diff --name-only`",

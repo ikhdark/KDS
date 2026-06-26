@@ -2,7 +2,6 @@ use regex::Regex;
 use std::collections::VecDeque;
 use std::sync::OnceLock;
 
-use crate::cli::SummaryBudget;
 use crate::storage::{ErrorWindow, SummarySidecar};
 
 const COMPACT_RUN_HEADER: &str = "KDS";
@@ -467,26 +466,10 @@ fn known_secret_re() -> &'static Regex {
 }
 
 pub fn format_compact_with_paths(sidecar: &SummarySidecar, show_paths: bool) -> String {
-    format_compact_with_budget(sidecar, show_paths, None)
+    apply_output_budget(format_compact_unbounded(sidecar, show_paths), sidecar)
 }
 
-pub fn format_compact_with_budget(
-    sidecar: &SummarySidecar,
-    show_paths: bool,
-    budget: Option<SummaryBudget>,
-) -> String {
-    apply_output_budget(
-        format_compact_unbounded(sidecar, show_paths, budget),
-        budget,
-        sidecar,
-    )
-}
-
-fn format_compact_unbounded(
-    sidecar: &SummarySidecar,
-    show_paths: bool,
-    budget: Option<SummaryBudget>,
-) -> String {
+fn format_compact_unbounded(sidecar: &SummarySidecar, show_paths: bool) -> String {
     if sidecar.exit_code == 0 && sidecar.warning_count == 0 {
         let mut out = format!(
             "{COMPACT_RUN_HEADER}\nRun ID: {}\nExit code: 0\nElapsed: {}\n{}\nEstimated output reduction: {} lines ({:.1}%)\nSummary: success\nNext action: {}\nWarnings: 0\n",
@@ -532,7 +515,7 @@ fn format_compact_unbounded(
         return out;
     }
 
-    let caps = display_caps(budget);
+    let caps = display_caps();
     let mut out = String::new();
     out.push_str(COMPACT_RUN_HEADER);
     out.push('\n');
@@ -969,10 +952,7 @@ fn log_line(sidecar: &SummarySidecar, show_paths: bool) -> String {
     if show_paths {
         format!("Log: {}", sidecar.log_path)
     } else {
-        format!(
-            "Log: use `kds logs show {} --show-paths` or `kds logs dir`",
-            sidecar.run_id
-        )
+        format!("Log: use `kds logs {} --show-paths`", sidecar.run_id)
     }
 }
 
@@ -1042,65 +1022,19 @@ struct DisplayCaps {
     chars: usize,
 }
 
-fn display_caps(budget: Option<SummaryBudget>) -> DisplayCaps {
-    let mut caps = match budget.or_else(budget_from_env) {
-        Some(SummaryBudget::Tight) => DisplayCaps {
-            top_errors: 2,
-            file_hits: 3,
-            tail: 6,
-            suggested: 2,
-            lines: 18,
-            chars: 2500,
-        },
-        Some(SummaryBudget::Wide) => DisplayCaps {
-            top_errors: 5,
-            file_hits: 10,
-            tail: 40,
-            suggested: 5,
-            lines: 80,
-            chars: 12000,
-        },
-        _ => DisplayCaps {
-            top_errors: 3,
-            file_hits: 5,
-            tail: 12,
-            suggested: 3,
-            lines: 30,
-            chars: 4000,
-        },
-    };
-    if let Ok(raw) = std::env::var("KDS_SUMMARY_BUDGET_LINES") {
-        if let Ok(lines) = raw.parse::<usize>() {
-            caps.lines = lines.max(6);
-        }
-    }
-    if let Ok(raw) = std::env::var("KDS_SUMMARY_BUDGET_CHARS") {
-        if let Ok(chars) = raw.parse::<usize>() {
-            caps.chars = chars.max(500);
-        }
-    }
-    caps
-}
-
-fn budget_from_env() -> Option<SummaryBudget> {
-    match std::env::var("KDS_SUMMARY_BUDGET")
-        .ok()
-        .map(|value| value.to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("tight") => Some(SummaryBudget::Tight),
-        Some("wide") => Some(SummaryBudget::Wide),
-        Some("normal") => Some(SummaryBudget::Normal),
-        _ => None,
+fn display_caps() -> DisplayCaps {
+    DisplayCaps {
+        top_errors: 3,
+        file_hits: 5,
+        tail: 12,
+        suggested: 3,
+        lines: 30,
+        chars: 4000,
     }
 }
 
-fn apply_output_budget(
-    text: String,
-    budget: Option<SummaryBudget>,
-    sidecar: &SummarySidecar,
-) -> String {
-    let caps = display_caps(budget);
+fn apply_output_budget(text: String, sidecar: &SummarySidecar) -> String {
+    let caps = display_caps();
     let mut out = String::new();
     let mut used_chars = 0;
     let mut truncated = false;
@@ -1116,12 +1050,10 @@ fn apply_output_budget(
     }
     if truncated {
         if sidecar.log_path.is_empty() {
-            out.push_str(
-                "Summary budget reached; rerun with `--budget wide` for more displayed context.\n",
-            );
+            out.push_str("Summary limit reached; rerun the command for more displayed context.\n");
         } else {
             out.push_str(&format!(
-                "Summary budget reached; use `kds logs show {} --errors` or `--error-window` for more.\n",
+                "Summary limit reached; use `kds logs {} --errors` or `--error-window` for more.\n",
                 sidecar.run_id
             ));
         }
@@ -1142,12 +1074,12 @@ fn suggested_next_commands(sidecar: &SummarySidecar) -> Vec<String> {
         return Vec::new();
     }
     let mut commands = vec![
-        format!("kds logs show {} --errors", sidecar.run_id),
-        format!("kds logs show {} --error-window", sidecar.run_id),
-        format!("kds logs show {} --file-hits", sidecar.run_id),
+        format!("kds logs {} --errors", sidecar.run_id),
+        format!("kds logs {} --error-window", sidecar.run_id),
+        format!("kds logs {} --file-hits", sidecar.run_id),
     ];
     if sidecar.top_errors.is_empty() && sidecar.error_windows.is_empty() {
-        commands[0] = format!("kds logs show {} --tail", sidecar.run_id);
+        commands[0] = format!("kds logs {} --tail", sidecar.run_id);
     }
     commands
 }
@@ -1546,7 +1478,7 @@ discord=aaaaaaaaaaaaaaaaaaaaaaaa.bbbbbb.cccccccccccccccccccccccccccccc
             !hidden.contains("C:\\Users\\tester\\kds\\run.log"),
             "hidden:\n{hidden}"
         );
-        assert!(hidden.contains("Log: use `kds logs show run-123 --show-paths`"));
+        assert!(hidden.contains("Log: use `kds logs run-123 --show-paths`"));
         assert!(
             hidden.contains("<cwd>\\src\\main.rs:1"),
             "hidden:\n{hidden}"

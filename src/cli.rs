@@ -22,9 +22,7 @@ enum Command {
     /// Show estimated output reduction metrics.
     Gain,
     /// Remove old local KDS run artifacts.
-    Gc(GcArgs),
-    /// Prune old local KDS run artifacts.
-    Prune(PruneArgs),
+    Clean(CleanArgs),
     /// Run read-only health checks.
     Doctor,
     /// Inspect stored log metadata and safe sections.
@@ -41,8 +39,6 @@ enum Command {
 pub struct WrappedCommand {
     #[arg(long)]
     pub show_paths: bool,
-    #[arg(long, value_enum)]
-    pub budget: Option<SummaryBudget>,
     /// Persist local KDS artifacts for later logs/evidence/gain commands.
     #[arg(long = "save-artifacts")]
     pub save_artifacts: bool,
@@ -63,47 +59,16 @@ pub struct SummarizeArgs {
     pub exit_code: i32,
     #[arg(long)]
     pub show_paths: bool,
-    #[arg(long, value_enum)]
-    pub budget: Option<SummaryBudget>,
     /// Persist local KDS artifacts for later logs/evidence/gain commands.
     #[arg(long = "save-artifacts")]
     pub save_artifacts: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum SummaryBudget {
-    Tight,
-    Normal,
-    Wide,
-}
-
 #[derive(Debug, Args)]
 pub struct LogsArgs {
-    #[command(subcommand)]
-    command: LogsCommand,
-}
-
-#[derive(Debug, Subcommand)]
-pub enum LogsCommand {
-    /// Print the KDS log directory.
-    Dir,
-    /// Print safe local log storage statistics.
-    Stats,
-    /// Print safe metadata for the most recent run.
-    Last(LogsDisplayArgs),
-    /// Show safe metadata or one requested section for a run.
-    Show(LogsShowArgs),
-}
-
-#[derive(Debug, Args)]
-pub struct LogsDisplayArgs {
-    #[arg(long)]
-    pub show_paths: bool,
-}
-
-#[derive(Debug, Args)]
-pub struct LogsShowArgs {
-    pub id: String,
+    /// Run ID to inspect, or `last`. Omit to print safe storage stats.
+    #[arg(value_name = "RUN_ID|last", num_args = 0..=2)]
+    pub target: Vec<String>,
     #[arg(long)]
     pub show_paths: bool,
     #[arg(long)]
@@ -119,23 +84,10 @@ pub struct LogsShowArgs {
 }
 
 #[derive(Debug, Args)]
-pub struct GcArgs {
+pub struct CleanArgs {
     /// Remove artifacts older than this age, such as 30d, 12h, or 90m.
     #[arg(long = "older-than")]
     pub older_than: String,
-    /// Report what would be deleted without removing files.
-    #[arg(long)]
-    pub dry_run: bool,
-}
-
-#[derive(Debug, Args)]
-pub struct PruneArgs {
-    /// Remove artifacts older than this age, such as 30d, 12h, or 90m.
-    #[arg(long = "before")]
-    pub before: String,
-    /// Report what would be deleted without removing files.
-    #[arg(long)]
-    pub dry_run: bool,
 }
 
 #[derive(Debug, Args)]
@@ -194,7 +146,6 @@ pub fn run() -> Result<i32> {
             raw_args.into_iter().skip(1).collect(),
             crate::runner::Mode::Compact,
             false,
-            None,
             false,
         );
     }
@@ -205,22 +156,19 @@ pub fn run() -> Result<i32> {
             args.command,
             crate::runner::Mode::Compact,
             args.show_paths,
-            args.budget,
             args.save_artifacts,
         ),
         Some(Command::Raw(args)) => crate::runner::run(
             args.command,
             crate::runner::Mode::Raw,
             args.show_paths,
-            args.budget,
             args.save_artifacts,
         ),
         Some(Command::Summarize(args)) => crate::runner::summarize_import(args),
         Some(Command::Gain) => crate::gain::run(),
-        Some(Command::Gc(args)) => crate::gc::run(args),
-        Some(Command::Prune(args)) => crate::gc::run_prune(args),
+        Some(Command::Clean(args)) => crate::gc::run(args),
         Some(Command::Doctor) => crate::doctor::run(),
-        Some(Command::Logs(args)) => crate::logs::run(args.command),
+        Some(Command::Logs(args)) => crate::logs::run(args),
         Some(Command::Evidence(args)) => crate::evidence::run(args.id, args.show_paths),
         Some(Command::Init(args)) => crate::init_codex::run(args),
         Some(Command::Hook(args)) => crate::hook::run(args.command),

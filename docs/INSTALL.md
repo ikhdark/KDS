@@ -11,7 +11,8 @@ irm https://raw.githubusercontent.com/ikhdark/KDS/v0.1.0/scripts/bootstrap.ps1 |
 The bootstrap installer downloads the versioned KDS release source archive and
 its matching `.sha256` file, verifies the archive, builds it locally, and runs
 the Windows installer from that source. It does not download a prebuilt binary.
-Rust/Cargo must already be available on PATH.
+Rust/Cargo must already be available on PATH. KDS does not download or install
+Rust/Cargo.
 
 From an existing KDS source checkout:
 
@@ -19,7 +20,8 @@ From an existing KDS source checkout:
 .\scripts\install.ps1
 ```
 
-The installer builds KDS locally, copies `kds.exe` into
+The installer requires Rust/Cargo to already be available on PATH. It does not
+download or install Rust/Cargo. The installer builds KDS locally, copies `kds.exe` into
 `%LOCALAPPDATA%\CodexKD\bin`, adds that directory to the user PATH when needed,
 installs the automatic PowerShell hook, installs or updates the Codex Desktop
 hook for detected Codex homes, and writes the matching Codex hook trust state so

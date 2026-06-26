@@ -286,7 +286,7 @@ function ConvertFrom-KdsSimpleCommand {
 
 function Test-KdsSafeTask {
   param([string]$Name)
-  return ([string]$Name) -match '^(test|build|check|lint|typecheck|ci|clippy)(-[A-Za-z0-9_.-]+)?$'
+  return ([string]$Name) -match '^(test|build|check|lint|typecheck|format-check|fmt-check|ci|clippy|vet|compile)(-[A-Za-z0-9_.-]+)?$'
 }
 
 function Test-KdsSafePythonModule {
@@ -300,16 +300,168 @@ function Test-KdsHasFlag {
     [string[]]$Flags
   )
   foreach ($arg in $Argv) {
-    if ($Flags -contains [string]$arg) {
+    if ($Flags -contains ([string]$arg).ToLowerInvariant()) {
       return $true
     }
   }
   return $false
 }
 
+function Test-KdsHasBlockingArg {
+  param([string[]]$Argv)
+  return (Test-KdsHasFlag $Argv @('--watch','--watchall','--watch-all','-w','--ui','--serve','--dev','--inspect','--inspect-brk'))
+}
+
+function Get-KdsFirstNonFlag {
+  param([string[]]$Argv)
+  foreach ($arg in $Argv) {
+    $text = [string]$arg
+    if ([string]::IsNullOrWhiteSpace($text)) {
+      continue
+    }
+    if ($text -eq '--') {
+      continue
+    }
+    if ($text.StartsWith('-')) {
+      continue
+    }
+    return $text
+  }
+  return $null
+}
+
+function Test-KdsScriptProfile {
+  param([string[]]$Argv)
+  $first = Get-KdsFirstNonFlag $Argv
+  if ($null -ne $first -and (Test-KdsSafeTask $first)) {
+    return $true
+  }
+  if ($Argv.Count -ge 2 -and @('run','run-script') -contains ([string]$Argv[0]).ToLowerInvariant() -and (Test-KdsSafeTask $Argv[1])) {
+    return $true
+  }
+  return $false
+}
+
+function Test-KdsGradleProfile {
+  param([string[]]$Argv)
+  $task = Get-KdsFirstNonFlag $Argv
+  if ($null -eq $task) {
+    return $false
+  }
+  $lower = ([string]$task).ToLowerInvariant()
+  if ($lower -match '(publish|deploy|upload|release|sign)') {
+    return $false
+  }
+  return ($lower -match '^(test|check|build|lint|compile[a-z0-9_.-]*|.*test.*|.*check)$')
+}
+
 function Get-KdsCommandName {
   param([string]$Value)
   return [System.IO.Path]::GetFileNameWithoutExtension([string]$Value).ToLowerInvariant()
+}
+
+function Test-KdsProfileShouldWrap {
+  param(
+    [string]$Name,
+    [string[]]$Argv
+  )
+  $command = ([string]$Name).ToLowerInvariant()
+  switch ($command) {
+    'cargo' {
+      return ($Argv.Count -gt 0 -and @('check','test','build','clippy') -contains ([string]$Argv[0]).ToLowerInvariant())
+    }
+    { @('just','make','task') -contains $_ } {
+      return (Test-KdsScriptProfile $Argv)
+    }
+    { @('npm','pnpm','yarn','bun') -contains $_ } {
+      if ($Argv.Count -gt 0 -and ([string]$Argv[0]).ToLowerInvariant() -eq 'test') {
+        return $true
+      }
+      return (Test-KdsScriptProfile $Argv)
+    }
+    'deno' {
+      if ($Argv.Count -gt 0 -and @('test','check','lint') -contains ([string]$Argv[0]).ToLowerInvariant()) {
+        return $true
+      }
+      return ($Argv.Count -ge 2 -and ([string]$Argv[0]).ToLowerInvariant() -eq 'task' -and (Test-KdsSafeTask $Argv[1]))
+    }
+    { @('tsc','vue-tsc','jest','vitest') -contains $_ } {
+      return -not (Test-KdsHasBlockingArg $Argv)
+    }
+    'eslint' {
+      return $true
+    }
+    'biome' {
+      return ($Argv.Count -gt 0 -and @('check','ci','lint') -contains ([string]$Argv[0]).ToLowerInvariant())
+    }
+    'prettier' {
+      return (Test-KdsHasFlag $Argv @('--check','-c'))
+    }
+    'playwright' {
+      return ($Argv.Count -gt 0 -and ([string]$Argv[0]).ToLowerInvariant() -eq 'test')
+    }
+    'pytest' {
+      return $true
+    }
+    { @('python','py') -contains $_ } {
+      return ($Argv.Count -ge 2 -and [string]$Argv[0] -eq '-m' -and (Test-KdsSafePythonModule $Argv[1]))
+    }
+    'ruff' {
+      return ($Argv.Count -gt 0 -and (([string]$Argv[0]).ToLowerInvariant() -eq 'check' -or (([string]$Argv[0]).ToLowerInvariant() -eq 'format' -and (Test-KdsHasFlag $Argv @('--check')))))
+    }
+    { @('mypy','pyright') -contains $_ } {
+      return $true
+    }
+    'uv' {
+      return ($Argv.Count -ge 2 -and ([string]$Argv[0]).ToLowerInvariant() -eq 'run' -and (Test-KdsSafePythonModule $Argv[1]))
+    }
+    'go' {
+      return ($Argv.Count -gt 0 -and @('test','build','vet') -contains ([string]$Argv[0]).ToLowerInvariant())
+    }
+    'dotnet' {
+      return ($Argv.Count -gt 0 -and @('test','build') -contains ([string]$Argv[0]).ToLowerInvariant())
+    }
+    { @('mvn','mvnw','maven') -contains $_ } {
+      $goal = Get-KdsFirstNonFlag $Argv
+      return ($null -ne $goal -and @('test','verify','package','compile') -contains ([string]$goal).ToLowerInvariant())
+    }
+    { @('gradle','gradlew') -contains $_ } {
+      return (Test-KdsGradleProfile $Argv)
+    }
+    'composer' {
+      return (Test-KdsScriptProfile $Argv)
+    }
+    'phpunit' {
+      return $true
+    }
+    'bundle' {
+      return ($Argv.Count -ge 2 -and ([string]$Argv[0]).ToLowerInvariant() -eq 'exec' -and @('rspec','rake','rails') -contains ([string]$Argv[1]).ToLowerInvariant() -and ($Argv.Count -lt 3 -or (Test-KdsSafeTask $Argv[2]) -or ([string]$Argv[1]).ToLowerInvariant() -eq 'rspec'))
+    }
+    'rails' {
+      return ($Argv.Count -gt 0 -and ([string]$Argv[0]).ToLowerInvariant() -eq 'test')
+    }
+    'rspec' {
+      return $true
+    }
+    'mix' {
+      return ($Argv.Count -gt 0 -and @('test','compile') -contains ([string]$Argv[0]).ToLowerInvariant())
+    }
+    'cmake' {
+      return ($Argv.Count -gt 0 -and ([string]$Argv[0]).ToLowerInvariant() -eq '--build')
+    }
+    'ninja' {
+      return (Test-KdsScriptProfile $Argv)
+    }
+    'ctest' {
+      return $true
+    }
+    'mise' {
+      return ($Argv.Count -ge 2 -and @('run','r') -contains ([string]$Argv[0]).ToLowerInvariant() -and (Test-KdsSafeTask $Argv[1]))
+    }
+    default {
+      return $false
+    }
+  }
 }
 
 function Test-KdsShouldWrapArgv {
@@ -319,61 +471,11 @@ function Test-KdsShouldWrapArgv {
   }
 
   $name = Get-KdsCommandName $Argv[0]
-  switch ($name) {
-    'cargo' {
-      return ($Argv.Count -ge 2 -and @('check','test','build','clippy') -contains $Argv[1])
-    }
-    'just' {
-      return ($Argv.Count -ge 2 -and (Test-KdsSafeTask $Argv[1]))
-    }
-    'npm' {
-      return (($Argv.Count -ge 2 -and $Argv[1] -eq 'test') -or
-        ($Argv.Count -ge 3 -and $Argv[1] -eq 'run' -and (Test-KdsSafeTask $Argv[2])))
-    }
-    'pnpm' {
-      return (($Argv.Count -ge 2 -and $Argv[1] -eq 'test') -or
-        ($Argv.Count -ge 3 -and $Argv[1] -eq 'run' -and (Test-KdsSafeTask $Argv[2])))
-    }
-    'pytest' {
-      return $true
-    }
-    'python' {
-      return ($Argv.Count -ge 3 -and $Argv[1] -eq '-m' -and (Test-KdsSafePythonModule $Argv[2]))
-    }
-    'py' {
-      return ($Argv.Count -ge 3 -and $Argv[1] -eq '-m' -and (Test-KdsSafePythonModule $Argv[2]))
-    }
-    { @('tsc','vue-tsc','eslint','vitest','jest','mypy','pyright') -contains $_ } {
-      return $true
-    }
-    'biome' {
-      return ($Argv.Count -ge 2 -and @('check','ci','lint') -contains $Argv[1])
-    }
-    'prettier' {
-      $hasCheck = Test-KdsHasFlag $Argv @('--check','-c')
-      return $hasCheck
-    }
-    'playwright' {
-      return ($Argv.Count -ge 2 -and $Argv[1] -eq 'test')
-    }
-    'ruff' {
-      $hasCheck = Test-KdsHasFlag $Argv @('--check')
-      return (($Argv.Count -ge 2 -and $Argv[1] -eq 'check') -or
-        ($Argv.Count -ge 2 -and $Argv[1] -eq 'format' -and $hasCheck))
-    }
-    'uv' {
-      return ($Argv.Count -ge 3 -and $Argv[1] -eq 'run' -and (Test-KdsSafePythonModule $Argv[2]))
-    }
-    'dotnet' {
-      return ($Argv.Count -ge 2 -and @('test','build') -contains $Argv[1])
-    }
-    'go' {
-      return ($Argv.Count -ge 2 -and @('test','build') -contains $Argv[1])
-    }
-    default {
-      return $false
-    }
+  $rest = @()
+  if ($Argv.Count -gt 1) {
+    $rest = @($Argv[1..($Argv.Count - 1)])
   }
+  return (Test-KdsProfileShouldWrap $name $rest)
 }
 
 function ConvertTo-KdsCommandArg {
@@ -712,6 +814,8 @@ Usage:
 
 Behavior:
   - builds KDS from this repository
+  - requires Rust/Cargo to already be available on PATH
+  - never downloads or installs Rust/Cargo
   - installs kds.exe to %LOCALAPPDATA%\CodexKD\bin
   - adds the install directory to the user PATH when missing
   - installs the automatic PowerShell hook by default unless --no-hook is set
@@ -743,8 +847,14 @@ if ($DryRun) {
   if (-not $NoHook) {
     [void](Install-KdsCodexDesktopHooks $true)
   }
-  Write-Host "Dry run: no source build, no binary copy, no PATH edit, and no hook/profile/Codex Desktop edit."
+  Write-Host "Dry run: no source build, no Rust/Cargo install, no binary copy, no PATH edit, and no hook/profile/Codex Desktop edit."
   exit 0
+}
+
+$cargo = Get-Command cargo -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+if (-not $cargo) {
+  Write-Error "Cargo was not found on PATH. KDS does not download or install Rust/Cargo. Install Rust/Cargo separately, then rerun the installer."
+  exit 1
 }
 
 Push-Location $repo

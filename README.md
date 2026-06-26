@@ -14,6 +14,8 @@ index, or metrics.
 - Summarizes pasted output, CI logs, crash logs, and existing log files.
 - Keeps default capture memory-only, with durable artifacts as an explicit
   opt-in.
+- Ships built-in profiles for JavaScript/TypeScript, Python, Go, Java/Kotlin,
+  .NET, PHP, Ruby, Elixir, C/C++, and common task runners.
 - Shows a short summary first instead of dumping the whole command output.
 - Avoids absolute log paths and working-directory paths by default.
 - Supports an explicit saved-artifact mode for local drilldown without making
@@ -26,7 +28,7 @@ index, or metrics.
   failures and file hits.
 - Reports PowerShell hook, Codex Desktop hook, Desktop hook trust, and local
   state health with `kds doctor`.
-- Shows safe local log storage stats and can prune old local KDS artifacts.
+- Shows safe local log storage stats and can remove old local KDS artifacts.
 - Tracks line, character, and approximate token reduction for saved artifacts.
 - Records spawn failures as compact summaries; saved artifact mode also indexes
   them as normal KDS runs.
@@ -59,19 +61,16 @@ matching `.sha256` file, verifies the archive, builds it locally, installs
 `kds.exe` under `%LOCALAPPDATA%\CodexKD\bin`, adds that directory to your user
 PATH, installs the PowerShell hook, and updates Codex Desktop hooks when it can
 find a Codex home. Rust/Cargo must already be on PATH. KDS does not download a
-prebuilt binary.
+prebuilt binary and does not download or install Rust/Cargo.
 
-After that, noisy verification commands like `cargo test` and `npm test` are
-routed through KDS automatically in PowerShell and in Codex Desktop where the
-hook is installed.
+After that, noisy non-interactive verification commands are routed through KDS
+automatically in PowerShell and in Codex Desktop where the hook is installed.
 
 You can also run KDS directly or summarize logs that already exist:
 
 ```powershell
-kds -- cargo test
-kds run -- npm test
-kds run --budget tight -- cargo test
-kds raw -- node --version
+kds -- <command...>
+kds raw -- <command...>
 Get-Content .\ci.log | kds summarize --name github-actions
 kds summarize --file .\ci.log --name github-actions --exit-code 1
 ```
@@ -80,18 +79,11 @@ kds summarize --file .\ci.log --name github-actions --exit-code 1
 
 ```powershell
 kds gain
-kds logs dir
-kds logs stats
-kds logs last
-kds logs show <run-id> --show-paths
-kds logs show <run-id> --errors
-kds logs show last --error-window
-kds logs show <run-id> --error-window
+kds logs
+kds logs <run-id|last> [--summary|--errors|--error-window|--tail|--file-hits|--show-paths]
 kds evidence last
 kds summarize --file .\ci.log --name github-actions
-kds gc --older-than 30d --dry-run
-kds gc --older-than 30d
-kds prune --before 30d --dry-run
+kds clean --older-than 30d
 kds doctor
 kds hook status
 kds hook uninstall powershell
@@ -106,12 +98,12 @@ sharing them.
 
 The normal summary and drilldown commands do not print raw stdout/stderr bodies.
 That includes `kds gain`, `kds doctor`, `kds logs last`, default
-`kds logs show <id>`, and `kds evidence last`.
+`kds logs <id>`, and `kds evidence last`.
 
 In memory-only mode, KDS prints compact evidence and notes that artifacts were
 not saved. In saved artifact mode, KDS prints a run ID and local drilldown
 commands instead of absolute paths. Use `--show-paths` with `kds run`,
-`kds logs last`, `kds logs show <id>`, or `kds evidence <id>` when you
+`kds logs last`, `kds logs <id>`, or `kds evidence <id>` when you
 explicitly want local paths.
 
 When artifacts are saved, KDS caps persisted raw stdout and stderr at 10 MiB
@@ -120,7 +112,7 @@ per stream by default. Set `KDS_MAX_RAW_BYTES` to a positive byte count such as
 so the wrapped command does not block. Set `KDS_UNCAPPED_RAW_LOGS=1` when you
 intentionally want uncapped raw persistence.
 
-Use `KDS_RETENTION_DAYS` to prune old local run artifacts on run start, and
+Use `KDS_RETENTION_DAYS` to remove old local run artifacts on run start, and
 `KDS_MAX_TOTAL_LOG_BYTES` to keep local KDS artifacts under a disk budget.
 `KDS_COMPRESS_AFTER_DAYS` gzips older raw `.log` files and updates matching
 sidecars to point at the compressed path.

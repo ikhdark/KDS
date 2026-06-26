@@ -5,7 +5,8 @@ KDS has no telemetry in V1.
 KDS itself makes no network calls in V1. The public PowerShell bootstrap
 installer is fetched from a versioned tag, then downloads the matching release
 source archive and `.sha256` file from GitHub, verifies the archive, and builds
-KDS locally. It does not download a prebuilt binary.
+KDS locally. It does not download a prebuilt binary and does not download or
+install Rust/Cargo.
 
 Default KDS runs are memory-only and do not write raw logs, temp stdout/stderr
 files, sidecars, run indexes, or metrics. Saved artifact mode is available only
@@ -20,12 +21,12 @@ artifact and before KDS writes sidecars, indexes, metrics, digest state, or
 evidence output. This is still a guardrail, not proof that every possible
 secret-like value was removed from imported content.
 
-KDS summary, evidence, gain, doctor, log-index, log-stats, GC, and prune
-commands are designed not to print raw stdout/stderr bodies by default.
+KDS summary, evidence, gain, doctor, log-index, log-stats, and clean commands
+are designed not to print raw stdout/stderr bodies by default.
 
 Default compact output also avoids absolute log and CWD paths. Saved artifact
 output prints the run ID and local drilldown commands such as
-`kds logs show <id> --show-paths` or `kds logs dir` instead of raw paths. Use
+`kds logs <id> --show-paths` instead of raw paths. Use
 `--show-paths` only for local interactive output where path disclosure is
 acceptable.
 
@@ -52,7 +53,7 @@ persistence. For imported logs in saved artifact mode, KDS still scans the full
 input for the summary while only persisting redacted imported bytes up to the
 same limit.
 
-Set `KDS_RETENTION_DAYS` or `KDS_MAX_TOTAL_LOG_BYTES` to prune old local KDS
+Set `KDS_RETENTION_DAYS` or `KDS_MAX_TOTAL_LOG_BYTES` to remove old local KDS
 artifacts automatically on run start. Set `KDS_COMPRESS_AFTER_DAYS` to gzip
 older raw `.log` files and update matching sidecars to the compressed path.
 After artifact deletion, KDS reconciles lookup state by removing index entries
