@@ -372,7 +372,7 @@ fn command_hook_hash(matcher: &str, command: &str, timeout: i64, status_message:
     let json = serde_json::to_string(&identity).unwrap_or_default();
     let mut hasher = Sha256::new();
     hasher.update(json.as_bytes());
-    format!("sha256:{:x}", hasher.finalize())
+    format!("sha256:{}", crate::hash::sha256_finalize_hex(hasher))
 }
 
 fn config_has_trust(config: &str, key: &str, trusted_hash: &str) -> bool {

@@ -5,6 +5,7 @@ $ErrorActionPreference = "Stop"
 
 $DryRun = $false
 $Help = $false
+$Version = "v0.1.0"
 
 foreach ($arg in $args) {
   switch ($arg) {
@@ -20,17 +21,34 @@ foreach ($arg in $args) {
   }
 }
 
-$archiveUrl = "https://github.com/ikhdark/KDS/archive/refs/heads/main.zip"
+$archiveUrl = "https://github.com/ikhdark/KDS/releases/download/$Version/KDS-$Version-source.zip"
+$checksumUrl = "$archiveUrl.sha256"
+
+function Get-KdsFileSha256 {
+  param([string]$Path)
+  return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+
+function Read-KdsExpectedSha256 {
+  param([string]$Path)
+  $text = Get-Content -LiteralPath $Path -Raw
+  $match = [regex]::Match($text, '(?i)\b[0-9a-f]{64}\b')
+  if (-not $match.Success) {
+    throw "Checksum file did not contain a SHA-256 digest"
+  }
+  return $match.Value.ToLowerInvariant()
+}
 
 if ($Help) {
   @"
 KDS bootstrap installer
 
 Copy-paste install:
-  irm https://raw.githubusercontent.com/ikhdark/KDS/main/scripts/bootstrap.ps1 | iex
+  irm https://raw.githubusercontent.com/ikhdark/KDS/$Version/scripts/bootstrap.ps1 | iex
 
 Behavior:
-  - downloads the KDS source archive
+  - downloads the versioned KDS release source archive
+  - verifies the archive SHA-256 checksum from the matching release asset
   - builds KDS with cargo
   - runs scripts/install.ps1 from the downloaded source
 "@ | Write-Host
@@ -38,10 +56,12 @@ Behavior:
 }
 
 Write-Host "KDS bootstrap install"
+Write-Host "Version: $Version"
 Write-Host "Source archive: $archiveUrl"
+Write-Host "Checksum: $checksumUrl"
 
 if ($DryRun) {
-  Write-Host "Dry run: no download, no extraction, no build, no install."
+  Write-Host "Dry run: no download, no checksum verification, no extraction, no build, no install."
   exit 0
 }
 
@@ -53,26 +73,33 @@ if (-not $cargo) {
 
 $workRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("kds-install-" + [System.Guid]::NewGuid().ToString("N"))
 $zipPath = Join-Path $workRoot "kds-source.zip"
+$checksumPath = Join-Path $workRoot "kds-source.zip.sha256"
 
 New-Item -ItemType Directory -Force -Path $workRoot | Out-Null
 
 try {
+  Write-Host "Downloading KDS source checksum..."
+  Invoke-WebRequest -Uri $checksumUrl -OutFile $checksumPath -UseBasicParsing
+  $expectedHash = Read-KdsExpectedSha256 $checksumPath
+
   Write-Host "Downloading KDS source..."
   Invoke-WebRequest -Uri $archiveUrl -OutFile $zipPath -UseBasicParsing
+  $actualHash = Get-KdsFileSha256 $zipPath
+  if ($actualHash -ne $expectedHash) {
+    throw "KDS source checksum mismatch. Expected $expectedHash but downloaded $actualHash"
+  }
+  Write-Host "Verified KDS source checksum: sha256:$actualHash"
 
   Write-Host "Extracting KDS source..."
   Expand-Archive -LiteralPath $zipPath -DestinationPath $workRoot -Force
-  $sourceRoot = Get-ChildItem -LiteralPath $workRoot -Directory |
-    Where-Object { $_.Name -like "KDS-*" } |
+  $sourceRoot = @((Get-Item -LiteralPath $workRoot)) + @(Get-ChildItem -LiteralPath $workRoot -Directory) |
+    Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName "scripts\install.ps1") -PathType Leaf } |
     Select-Object -First 1
   if (-not $sourceRoot) {
-    throw "Downloaded archive did not contain a KDS source directory"
+    throw "Downloaded archive did not contain scripts\install.ps1"
   }
 
   $installer = Join-Path $sourceRoot.FullName "scripts\install.ps1"
-  if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) {
-    throw "Downloaded archive did not contain scripts\install.ps1"
-  }
 
   Write-Host "Running KDS installer..."
   & $installer

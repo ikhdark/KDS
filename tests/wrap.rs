@@ -85,6 +85,7 @@ fn wraps_real_command_and_writes_local_run_artifacts() {
 
     let output = Command::new(kds_bin())
         .env("KDS_HOME", kds_home.path())
+        .env("KDS_SAVE_ARTIFACTS", "1")
         .arg("--")
         .arg("rustc")
         .arg("--version")
@@ -139,6 +140,152 @@ fn wraps_real_command_and_writes_local_run_artifacts() {
 }
 
 #[test]
+fn default_run_does_not_write_local_artifacts() {
+    let kds_home = tempfile::tempdir().unwrap();
+
+    let output = Command::new(kds_bin())
+        .env("KDS_HOME", kds_home.path())
+        .arg("--")
+        .arg("rustc")
+        .arg("--version")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.starts_with("KDS\n"), "stdout:\n{stdout}");
+    assert!(stdout.contains("Artifacts: not saved"), "stdout:\n{stdout}");
+    assert!(!stdout.contains("--save-artifacts"), "stdout:\n{stdout}");
+    assert!(!stdout.contains("logs/evidence"), "stdout:\n{stdout}");
+    assert!(
+        !kds_home.path().join("logs").exists(),
+        "logs dir should not be created"
+    );
+    assert!(
+        !kds_home.path().join("state").exists(),
+        "state dir should not be created"
+    );
+}
+
+#[test]
+fn default_summarize_does_not_write_local_artifacts() {
+    let kds_home = tempfile::tempdir().unwrap();
+    let input_dir = tempfile::tempdir().unwrap();
+    let log_path = input_dir.path().join("ci.log");
+    fs::write(
+        &log_path,
+        "src/app.ts(12,7): error TS2304: Cannot find name 'x'.\n",
+    )
+    .unwrap();
+
+    let output = Command::new(kds_bin())
+        .env("KDS_HOME", kds_home.path())
+        .arg("summarize")
+        .arg("--file")
+        .arg(&log_path)
+        .arg("--name")
+        .arg("ci-log")
+        .arg("--exit-code")
+        .arg("1")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.starts_with("KDS\n"), "stdout:\n{stdout}");
+    assert!(stdout.contains("Artifacts: not saved"), "stdout:\n{stdout}");
+    assert!(!stdout.contains("--save-artifacts"), "stdout:\n{stdout}");
+    assert!(!stdout.contains("logs/evidence"), "stdout:\n{stdout}");
+    assert!(stdout.contains("Exit code: 1"), "stdout:\n{stdout}");
+    assert!(stdout.contains("src/app.ts:12:7"), "stdout:\n{stdout}");
+    assert!(
+        !kds_home.path().join("logs").exists(),
+        "logs dir should not be created"
+    );
+    assert!(
+        !kds_home.path().join("state").exists(),
+        "state dir should not be created"
+    );
+}
+
+#[test]
+fn summarizes_existing_log_file_into_safe_artifacts() {
+    let kds_home = tempfile::tempdir().unwrap();
+    let input_dir = tempfile::tempdir().unwrap();
+    let log_path = input_dir.path().join("ci.log");
+    fs::write(
+        &log_path,
+        "C:\\repo\\src\\app.ts\n  12:7  error  token=SECRET_CANARY_VALUE failed  no-undef\nfinal tail\n",
+    )
+    .unwrap();
+
+    let output = Command::new(kds_bin())
+        .env("KDS_HOME", kds_home.path())
+        .arg("summarize")
+        .arg("--file")
+        .arg(&log_path)
+        .arg("--name")
+        .arg("ci-log")
+        .arg("--exit-code")
+        .arg("1")
+        .arg("--save-artifacts")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.starts_with("KDS\n"), "stdout:\n{stdout}");
+    assert!(
+        stdout.contains("Command: kds-summarize ci-log"),
+        "stdout:\n{stdout}"
+    );
+    assert!(stdout.contains("Exit code: 1"), "stdout:\n{stdout}");
+    assert!(stdout.contains("src\\app.ts:12:7"), "stdout:\n{stdout}");
+    assert!(!stdout.contains("SECRET_CANARY_VALUE"), "stdout:\n{stdout}");
+    assert!(
+        !stdout.contains(&kds_home.path().display().to_string()),
+        "stdout:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains(&log_path.display().to_string()),
+        "stdout:\n{stdout}"
+    );
+
+    let logs = collect_files(&kds_home.path().join("logs"), "log");
+    assert_eq!(logs.len(), 1, "logs: {logs:?}");
+    let log = String::from_utf8_lossy(&fs::read(&logs[0]).unwrap()).to_string();
+    assert!(log.contains("Command: kds-summarize ci-log"), "log:\n{log}");
+    assert!(log.contains("token=[redacted]"), "log:\n{log}");
+    assert!(!log.contains("SECRET_CANARY_VALUE"), "log:\n{log}");
+
+    let summaries = collect_files(&kds_home.path().join("logs"), "json");
+    assert_eq!(summaries.len(), 1, "summaries: {summaries:?}");
+    let sidecar: serde_json::Value =
+        serde_json::from_slice(&fs::read(&summaries[0]).unwrap()).unwrap();
+    assert_eq!(sidecar["mode"].as_str(), Some("import"));
+    assert_eq!(
+        sidecar["capture_mode"].as_str(),
+        Some("file import; redacted before local artifact write")
+    );
+    assert_eq!(sidecar["exit_code"].as_i64(), Some(1));
+    assert!(sidecar["top_errors"][0]
+        .as_str()
+        .unwrap()
+        .contains("src\\app.ts:12:7"));
+
+    let evidence = Command::new(kds_bin())
+        .env("KDS_HOME", kds_home.path())
+        .arg("evidence")
+        .arg("last")
+        .output()
+        .unwrap();
+    assert!(evidence.status.success(), "{evidence:?}");
+    let stdout = String::from_utf8_lossy(&evidence.stdout);
+    assert!(stdout.contains("KDS evidence"), "stdout:\n{stdout}");
+    assert!(!stdout.contains("SECRET_CANARY_VALUE"), "stdout:\n{stdout}");
+}
+
+#[test]
 fn show_paths_explicitly_prints_log_path() {
     let kds_home = tempfile::tempdir().unwrap();
 
@@ -146,6 +293,7 @@ fn show_paths_explicitly_prints_log_path() {
         .env("KDS_HOME", kds_home.path())
         .arg("run")
         .arg("--show-paths")
+        .arg("--save-artifacts")
         .arg("--")
         .arg("rustc")
         .arg("--version")
@@ -206,6 +354,7 @@ fn raw_log_command_header_redacts_sensitive_argv() {
 
     let output = Command::new(kds_bin())
         .env("KDS_HOME", kds_home.path())
+        .env("KDS_SAVE_ARTIFACTS", "1")
         .arg("--")
         .arg(shim)
         .arg("--token")
@@ -227,6 +376,7 @@ fn raw_log_capture_can_be_capped_by_env() {
 
     let output = Command::new(kds_bin())
         .env("KDS_HOME", kds_home.path())
+        .env("KDS_SAVE_ARTIFACTS", "1")
         .env("KDS_MAX_RAW_BYTES", "5")
         .arg("--")
         .arg("rustc")
@@ -242,6 +392,13 @@ fn raw_log_capture_can_be_capped_by_env() {
         log.contains("stdout raw log capture reached 5 bytes"),
         "log:\n{log}"
     );
+    let summaries = collect_files(&kds_home.path().join("logs"), "json");
+    assert_eq!(summaries.len(), 1, "summaries: {summaries:?}");
+    let sidecar: serde_json::Value =
+        serde_json::from_slice(&fs::read(&summaries[0]).unwrap()).unwrap();
+    assert_eq!(sidecar["raw_byte_limit"].as_u64(), Some(5));
+    assert_eq!(sidecar["raw_stdout_truncated"].as_bool(), Some(true));
+    assert!(sidecar["raw_stdout_discarded_bytes"].as_u64().unwrap() > 0);
 }
 
 #[test]
@@ -326,6 +483,7 @@ fn logs_stats_reports_safe_artifact_counts() {
 
     let run = Command::new(kds_bin())
         .env("KDS_HOME", kds_home.path())
+        .env("KDS_SAVE_ARTIFACTS", "1")
         .arg("--")
         .arg("rustc")
         .arg("--version")
@@ -426,6 +584,7 @@ fn logs_show_error_window_prints_bounded_context() {
 
     let output = Command::new(kds_bin())
         .env("KDS_HOME", kds_home.path())
+        .env("KDS_SAVE_ARTIFACTS", "1")
         .arg("--")
         .arg("pwsh")
         .arg("-NoProfile")
@@ -471,6 +630,7 @@ fn repeat_failures_use_short_compact_output_and_digest_shards() {
     for _ in 0..2 {
         let output = Command::new(kds_bin())
             .env("KDS_HOME", kds_home.path())
+            .env("KDS_SAVE_ARTIFACTS", "1")
             .arg("--")
             .arg("pwsh")
             .arg("-NoProfile")
@@ -499,6 +659,7 @@ fn spawn_failure_writes_run_artifacts() {
 
     let output = Command::new(kds_bin())
         .env("KDS_HOME", kds_home.path())
+        .env("KDS_SAVE_ARTIFACTS", "1")
         .arg("--")
         .arg("definitely-not-a-real-kds-test-command")
         .output()
@@ -537,6 +698,7 @@ fn parallel_runs_keep_index_and_artifacts_consistent() {
         handles.push(thread::spawn(move || {
             Command::new(kds_bin())
                 .env("KDS_HOME", kds_home)
+                .env("KDS_SAVE_ARTIFACTS", "1")
                 .arg("--")
                 .arg("rustc")
                 .arg("--version")
@@ -584,6 +746,7 @@ fn wraps_windows_pathext_cmd_shim_end_to_end() {
     let output = Command::new(kds_bin())
         .env("KDS_HOME", kds_home.path())
         .env("PATH", path)
+        .env("KDS_SAVE_ARTIFACTS", "1")
         .arg("--")
         .arg("foo")
         .arg("ok")

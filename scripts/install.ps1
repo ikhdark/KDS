@@ -78,7 +78,25 @@ function Add-KdsUserPath {
 }
 
 function Get-KdsTimestamp {
-  return (Get-Date).ToString("yyyyMMddTHHmmss")
+  return (Get-Date).ToString("yyyyMMddTHHmmssfffffff")
+}
+
+function Get-KdsUniqueSiblingPath {
+  param(
+    [string]$Path,
+    [string]$Suffix
+  )
+  for ($i = 0; $i -lt 100; $i += 1) {
+    $candidate = if ($i -eq 0) {
+      "$Path.$Suffix-$(Get-KdsTimestamp)-$PID"
+    } else {
+      "$Path.$Suffix-$(Get-KdsTimestamp)-$PID-$i"
+    }
+    if (-not (Test-Path -LiteralPath $candidate)) {
+      return $candidate
+    }
+  }
+  throw "Could not allocate a unique sibling path for $Path"
 }
 
 function Backup-KdsFile {
@@ -86,10 +104,50 @@ function Backup-KdsFile {
   if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
     return $null
   }
-  $backup = "$Path.kds-backup-$(Get-KdsTimestamp)"
-  Copy-Item -LiteralPath $Path -Destination $backup -Force
+  $backup = Get-KdsUniqueSiblingPath $Path "kds-backup"
+  Copy-Item -LiteralPath $Path -Destination $backup
   Write-Host "Backed up: $backup"
   return $backup
+}
+
+function Set-KdsFileContentAtomic {
+  param(
+    [string]$Path,
+    [string]$Content
+  )
+  $parent = Split-Path -Parent $Path
+  if (-not [string]::IsNullOrWhiteSpace($parent)) {
+    New-Item -ItemType Directory -Force -Path $parent | Out-Null
+  }
+
+  $tmp = Get-KdsUniqueSiblingPath $Path "tmp"
+  $encoding = [System.Text.UTF8Encoding]::new($false)
+  $bytes = $encoding.GetBytes($Content)
+  $stream = [System.IO.FileStream]::new(
+    $tmp,
+    [System.IO.FileMode]::CreateNew,
+    [System.IO.FileAccess]::Write,
+    [System.IO.FileShare]::None
+  )
+  try {
+    $stream.Write($bytes, 0, $bytes.Length)
+    $stream.Flush($true)
+  } finally {
+    $stream.Dispose()
+  }
+
+  try {
+    if (Test-Path -LiteralPath $Path -PathType Leaf) {
+      [System.IO.File]::Replace($tmp, $Path, $null, $true)
+    } else {
+      [System.IO.File]::Move($tmp, $Path)
+    }
+  } catch {
+    if (Test-Path -LiteralPath $tmp -PathType Leaf) {
+      Remove-Item -LiteralPath $tmp -Force
+    }
+    throw
+  }
 }
 
 function Set-KdsFileContentIfChanged {
@@ -106,7 +164,7 @@ function Set-KdsFileContentIfChanged {
     return $false
   }
   [void](Backup-KdsFile $Path)
-  Set-Content -LiteralPath $Path -Value $Content -Encoding UTF8 -NoNewline
+  Set-KdsFileContentAtomic $Path $Content
   Write-Host "Wrote: $Path"
   return $true
 }
@@ -181,6 +239,151 @@ function Get-KdsDesktopHookScript {
   return @'
 $ErrorActionPreference = 'Stop'
 
+function ConvertFrom-KdsSimpleCommand {
+  param([string]$Command)
+  $trimmed = $Command.Trim()
+  if ([string]::IsNullOrWhiteSpace($trimmed)) {
+    return $null
+  }
+  if ($trimmed -match '(?i)^kds(\.exe)?\b') {
+    return $null
+  }
+
+  # Only rewrite one simple argv-equivalent command. Anything with shell
+  # control, expansion, variables, comments, or parse errors runs natively.
+  if ($trimmed -match '[\r\n]|&&|\|\||[|<>;&`]') {
+    return $null
+  }
+
+  $errors = $null
+  $tokens = [System.Management.Automation.PSParser]::Tokenize($trimmed, [ref]$errors)
+  if ($errors -and $errors.Count -gt 0) {
+    return $null
+  }
+
+  $argv = [System.Collections.Generic.List[string]]::new()
+  foreach ($token in $tokens) {
+    $type = [string]$token.Type
+    if ($type -eq 'Command' -or $type -eq 'CommandArgument' -or $type -eq 'String' -or $type -eq 'Number') {
+      if ([string]$token.Content -match '[*?\[\]]') {
+        return $null
+      }
+      [void]$argv.Add([string]$token.Content)
+      continue
+    }
+    if ($type -eq 'Operator' -and [string]$token.Content -eq '--') {
+      [void]$argv.Add('--')
+      continue
+    }
+    return $null
+  }
+
+  if ($argv.Count -eq 0) {
+    return $null
+  }
+  return $argv.ToArray()
+}
+
+function Test-KdsSafeTask {
+  param([string]$Name)
+  return ([string]$Name) -match '^(test|build|check|lint|typecheck|ci|clippy)(-[A-Za-z0-9_.-]+)?$'
+}
+
+function Test-KdsSafePythonModule {
+  param([string]$Name)
+  return @('pytest','unittest','ruff','mypy','pyright') -contains [string]$Name
+}
+
+function Test-KdsHasFlag {
+  param(
+    [string[]]$Argv,
+    [string[]]$Flags
+  )
+  foreach ($arg in $Argv) {
+    if ($Flags -contains [string]$arg) {
+      return $true
+    }
+  }
+  return $false
+}
+
+function Get-KdsCommandName {
+  param([string]$Value)
+  return [System.IO.Path]::GetFileNameWithoutExtension([string]$Value).ToLowerInvariant()
+}
+
+function Test-KdsShouldWrapArgv {
+  param([string[]]$Argv)
+  if ($Argv.Count -eq 0) {
+    return $false
+  }
+
+  $name = Get-KdsCommandName $Argv[0]
+  switch ($name) {
+    'cargo' {
+      return ($Argv.Count -ge 2 -and @('check','test','build','clippy') -contains $Argv[1])
+    }
+    'just' {
+      return ($Argv.Count -ge 2 -and (Test-KdsSafeTask $Argv[1]))
+    }
+    'npm' {
+      return (($Argv.Count -ge 2 -and $Argv[1] -eq 'test') -or
+        ($Argv.Count -ge 3 -and $Argv[1] -eq 'run' -and (Test-KdsSafeTask $Argv[2])))
+    }
+    'pnpm' {
+      return (($Argv.Count -ge 2 -and $Argv[1] -eq 'test') -or
+        ($Argv.Count -ge 3 -and $Argv[1] -eq 'run' -and (Test-KdsSafeTask $Argv[2])))
+    }
+    'pytest' {
+      return $true
+    }
+    'python' {
+      return ($Argv.Count -ge 3 -and $Argv[1] -eq '-m' -and (Test-KdsSafePythonModule $Argv[2]))
+    }
+    'py' {
+      return ($Argv.Count -ge 3 -and $Argv[1] -eq '-m' -and (Test-KdsSafePythonModule $Argv[2]))
+    }
+    { @('tsc','vue-tsc','eslint','vitest','jest','mypy','pyright') -contains $_ } {
+      return $true
+    }
+    'biome' {
+      return ($Argv.Count -ge 2 -and @('check','ci','lint') -contains $Argv[1])
+    }
+    'prettier' {
+      $hasCheck = Test-KdsHasFlag $Argv @('--check','-c')
+      return $hasCheck
+    }
+    'playwright' {
+      return ($Argv.Count -ge 2 -and $Argv[1] -eq 'test')
+    }
+    'ruff' {
+      $hasCheck = Test-KdsHasFlag $Argv @('--check')
+      return (($Argv.Count -ge 2 -and $Argv[1] -eq 'check') -or
+        ($Argv.Count -ge 2 -and $Argv[1] -eq 'format' -and $hasCheck))
+    }
+    'uv' {
+      return ($Argv.Count -ge 3 -and $Argv[1] -eq 'run' -and (Test-KdsSafePythonModule $Argv[2]))
+    }
+    'dotnet' {
+      return ($Argv.Count -ge 2 -and @('test','build') -contains $Argv[1])
+    }
+    'go' {
+      return ($Argv.Count -ge 2 -and @('test','build') -contains $Argv[1])
+    }
+    default {
+      return $false
+    }
+  }
+}
+
+function ConvertTo-KdsCommandArg {
+  param([AllowNull()][string]$Arg)
+  if ($null -eq $Arg) {
+    return "''"
+  }
+  return "'" + $Arg.Replace("'", "''") + "'"
+}
+
 $inputJson = [Console]::In.ReadToEnd()
 if ([string]::IsNullOrWhiteSpace($inputJson)) {
   exit 0
@@ -201,34 +404,13 @@ if ($event.tool_name -ne 'Bash') {
 }
 
 $command = [string]$event.tool_input.command
-if ([string]::IsNullOrWhiteSpace($command)) {
+$parsedArgv = ConvertFrom-KdsSimpleCommand $command
+if ($null -eq $parsedArgv) {
   exit 0
 }
+$argv = @($parsedArgv)
 
-$trimmed = $command.Trim()
-if ($trimmed -match '(?i)^kds(\.exe)?\b') {
-  exit 0
-}
-
-# KDS executes argv directly, so only rewrite simple commands with no shell control.
-if ($trimmed -match '[\r\n]|&&|\|\||[|<>;&`]') {
-  exit 0
-}
-
-$shouldWrap = $false
-switch -Regex ($trimmed) {
-  '(?i)^cargo\s+(check|test|build|clippy)(\s|$)' { $shouldWrap = $true; break }
-  '(?i)^just\s+(test|build|check|lint|typecheck|ci|clippy)(\s|$)' { $shouldWrap = $true; break }
-  '(?i)^npm\s+test(\s|$)' { $shouldWrap = $true; break }
-  '(?i)^npm\s+run\s+(test|build|check|lint|typecheck|ci|clippy)(\s|$)' { $shouldWrap = $true; break }
-  '(?i)^pnpm\s+test(\s|$)' { $shouldWrap = $true; break }
-  '(?i)^pnpm\s+run\s+(test|build|check|lint|typecheck|ci|clippy)(\s|$)' { $shouldWrap = $true; break }
-  '(?i)^pytest(\s|$)' { $shouldWrap = $true; break }
-  '(?i)^python\s+-m\s+(pytest|unittest)(\s|$)' { $shouldWrap = $true; break }
-  '(?i)^py\s+-m\s+(pytest|unittest)(\s|$)' { $shouldWrap = $true; break }
-}
-
-if (-not $shouldWrap) {
+if (-not (Test-KdsShouldWrapArgv $argv)) {
   exit 0
 }
 
@@ -241,12 +423,8 @@ if (-not (Test-Path -LiteralPath $kdsExe -PathType Leaf)) {
   $kdsExe = $resolved.Source
 }
 
-$kdsDir = Split-Path -Parent $kdsExe
-if ($kdsDir -and -not (($env:PATH -split ';') -contains $kdsDir)) {
-  $env:PATH = "$kdsDir;$env:PATH"
-}
-
-$updatedCommand = "KDS -- $trimmed"
+$quotedArgs = $argv | ForEach-Object { ConvertTo-KdsCommandArg $_ }
+$updatedCommand = "& $(ConvertTo-KdsCommandArg $kdsExe) -- $($quotedArgs -join ' ')"
 
 $response = [ordered]@{
   hookSpecificOutput = [ordered]@{
@@ -492,8 +670,7 @@ function Update-KdsCodexConfigHookTrust {
     Write-Host "Codex Desktop hook trust already current: $configPath"
     return $trustEntries.Count
   }
-  [void](Backup-KdsFile $configPath)
-  Set-Content -LiteralPath $configPath -Value $updated -Encoding UTF8 -NoNewline
+  [void](Set-KdsFileContentIfChanged $configPath $updated)
   Write-Host "Updated Codex Desktop hook trust: $configPath"
   return $trustEntries.Count
 }

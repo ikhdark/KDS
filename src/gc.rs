@@ -8,6 +8,11 @@ pub fn run(args: GcArgs) -> Result<i32> {
     let older_than = parse_age(&args.older_than)?;
     let paths = storage::Paths::discover()?;
     let report = storage::gc_artifacts(&paths, older_than, args.dry_run)?;
+    let state_report = if should_reconcile_state(&paths, &report, args.dry_run) {
+        Some(storage::reconcile_state_after_artifact_cleanup(&paths)?)
+    } else {
+        None
+    };
 
     println!("KDS gc");
     println!("Older than: {}", args.older_than);
@@ -19,6 +24,7 @@ pub fn run(args: GcArgs) -> Result<i32> {
     } else {
         println!("Deleted: {}", report.deleted_artifacts);
         println!("Bytes deleted: {}", format_bytes(report.deleted_bytes));
+        print_state_reconciliation(state_report.as_ref());
     }
     Ok(0)
 }
@@ -27,6 +33,11 @@ pub fn run_prune(args: PruneArgs) -> Result<i32> {
     let older_than = parse_age(&args.before)?;
     let paths = storage::Paths::discover()?;
     let report = storage::gc_artifacts(&paths, older_than, args.dry_run)?;
+    let state_report = if should_reconcile_state(&paths, &report, args.dry_run) {
+        Some(storage::reconcile_state_after_artifact_cleanup(&paths)?)
+    } else {
+        None
+    };
 
     println!("KDS prune");
     println!("Before: {}", args.before);
@@ -38,8 +49,35 @@ pub fn run_prune(args: PruneArgs) -> Result<i32> {
     } else {
         println!("Deleted: {}", report.deleted_artifacts);
         println!("Bytes deleted: {}", format_bytes(report.deleted_bytes));
+        print_state_reconciliation(state_report.as_ref());
     }
     Ok(0)
+}
+
+fn should_reconcile_state(
+    paths: &storage::Paths,
+    report: &storage::GcReport,
+    dry_run: bool,
+) -> bool {
+    !dry_run
+        && (report.deleted_artifacts > 0
+            || paths.runs_index.exists()
+            || paths.latest_by_command.exists()
+            || paths.digest_dir.exists()
+            || paths.state_dir.join("unresolved-by-command").exists())
+}
+
+fn print_state_reconciliation(report: Option<&storage::StateReconciliationReport>) {
+    let Some(report) = report else {
+        return;
+    };
+    println!(
+        "State reconciled: {} stale index entry(s), {} latest entry(s), {} digest shard(s), {} unresolved digest ref(s)",
+        report.index_entries_removed,
+        report.latest_entries_rebuilt,
+        report.digest_shards_removed,
+        report.unresolved_digest_refs_removed
+    );
 }
 
 fn parse_age(raw: &str) -> Result<Duration> {

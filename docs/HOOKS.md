@@ -7,9 +7,9 @@ KDS without manual configuration.
 
 When installing or repairing hooks, KDS backs up an existing PowerShell profile,
 Desktop hook script, Desktop `hooks.json`, or Codex `config.toml` before
-rewriting it. For Desktop hooks, the installer also writes the matching
-`hooks.state` trust entry so the installed hook is active without a manual
-approval step.
+rewriting it through a same-directory temp file and replace operation. For
+Desktop hooks, the installer also writes the matching `hooks.state` trust entry
+so the installed hook is active without a manual approval step.
 
 The hook is allowlisted and conservative. If it is uncertain, it runs the
 original command unchanged.
@@ -47,17 +47,30 @@ commands, and publish/install proof-line extraction.
 
 For package scripts and `just`, the automatic hook wraps common verification
 tasks only: `test`, `build`, `check`, `lint`, `typecheck`, `ci`, and `clippy`.
-Other script or recipe names run natively because they may deploy, prompt, or
-print sensitive operational output.
+Hyphenated variants of those task names, such as `test-fast`, are treated as
+the same verification family. Other script or recipe names run natively because
+they may deploy, prompt, or print sensitive operational output.
 
-For Python, the automatic hook wraps test runners only: `pytest`,
-`python -m pytest`, and `python -m unittest`. Other `python ...` commands run
-natively because they may be interactive, long-running, or print sensitive
-operational output.
+For TypeScript and JavaScript, the automatic hook wraps common bounded
+verification commands: `tsc`, `vue-tsc`, `eslint`, `vitest`, `jest`,
+`playwright test`, `biome check`, `biome ci`, `biome lint`, and
+`prettier --check`.
 
-The Codex Desktop hook rewrites matched shell commands to `KDS -- ...` so
-Desktop status text shows the short KDS command rather than the full local
-install path. It only rewrites simple commands without shell control operators.
+For Python, the automatic hook wraps test and static-analysis runners:
+`pytest`, `python -m pytest`, `python -m unittest`, `python -m ruff`,
+`python -m mypy`, `python -m pyright`, `ruff check`, `ruff format --check`,
+`mypy`, `pyright`, and matching `uv run ...` forms. Other `python ...`
+commands run natively because they may be interactive, long-running, or print
+sensitive operational output.
+
+For .NET and Go, the automatic hook wraps bounded build and test commands:
+`dotnet build`, `dotnet test`, `go build`, and `go test`.
+
+The Codex Desktop hook parses matched shell commands into PowerShell argv tokens
+and rewrites only commands it can prove are simple argv-equivalent allowlist
+matches. Ambiguous input, shell control operators, expansion, variables,
+comments, parse errors, and wildcard tokens run natively. Rewritten commands use
+the resolved local `kds.exe -- ...` path with each original argument quoted.
 
 Managed PowerShell profile block:
 

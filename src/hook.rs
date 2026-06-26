@@ -133,19 +133,19 @@ fn hook_block() -> Result<String> {
     Ok(format!(
         r#"{START}
 # Managed by KDS. Remove with: kds hook uninstall powershell
-$script:KdsExe = '{exe}'
-$script:KdsCommand = [System.IO.Path]::GetFileName($script:KdsExe)
-$script:KdsExeDir = Split-Path -Parent $script:KdsExe
-if ($script:KdsExeDir -and -not (($env:PATH -split ';') -contains $script:KdsExeDir)) {{
-  $env:PATH = "$script:KdsExeDir;$env:PATH"
+$global:KdsExe = '{exe}'
+$global:KdsCommand = [System.IO.Path]::GetFileName($global:KdsExe)
+$global:KdsExeDir = Split-Path -Parent $global:KdsExe
+if ($global:KdsExeDir -and -not (($env:PATH -split ';') -contains $global:KdsExeDir)) {{
+  $env:PATH = "$global:KdsExeDir;$env:PATH"
 }}
 function KDS {{
   $kdsArgs = @($args)
-  $kdsCommands = @('run','raw','gain','gc','prune','doctor','logs','evidence','init','hook','help')
+  $kdsCommands = @('run','raw','summarize','gain','gc','prune','doctor','logs','evidence','init','hook','help')
   if ($kdsArgs.Count -gt 0 -and -not ([string]$kdsArgs[0]).StartsWith('-') -and -not ($kdsCommands -contains [string]$kdsArgs[0])) {{
     $kdsArgs = @('--') + $kdsArgs
   }}
-  & $script:KdsCommand @kdsArgs
+  & $global:KdsCommand @kdsArgs
 }}
 if (-not $global:KdsPromptWrapped) {{
   $global:KdsPromptWrapped = $true
@@ -209,7 +209,18 @@ function _kds_wrap {{
 }}
 function _kds_safe_task {{
   param([string]$Name)
-  return @('test','build','check','lint','typecheck','ci','clippy') -contains $Name
+  return ([string]$Name) -match '^(test|build|check|lint|typecheck|ci|clippy)(-[A-Za-z0-9_.-]+)?$'
+}}
+function _kds_has_flag {{
+  param([object[]]$Rest, [string[]]$Flags)
+  foreach ($arg in $Rest) {{
+    if ($Flags -contains [string]$arg) {{ return $true }}
+  }}
+  return $false
+}}
+function _kds_safe_python_module {{
+  param([string]$Name)
+  return @('pytest','unittest','ruff','mypy','pyright') -contains [string]$Name
 }}
 function cargo {{
   $rest = @(_kds_restore_args $args $MyInvocation.Statement)
@@ -233,7 +244,65 @@ function pytest {{
 }}
 function python {{
   $rest = @(_kds_restore_args $args $MyInvocation.Statement)
-  if ($rest.Count -ge 2 -and $rest[0] -eq '-m' -and (@('pytest','unittest') -contains $rest[1])) {{ _kds_wrap 'python' $rest }} else {{ _kds_call_native 'python' $rest }}
+  if ($rest.Count -ge 2 -and $rest[0] -eq '-m' -and (_kds_safe_python_module $rest[1])) {{ _kds_wrap 'python' $rest }} else {{ _kds_call_native 'python' $rest }}
+}}
+function tsc {{
+  $rest = @(_kds_restore_args $args $MyInvocation.Statement)
+  _kds_wrap 'tsc' $rest
+}}
+function vue-tsc {{
+  $rest = @(_kds_restore_args $args $MyInvocation.Statement)
+  _kds_wrap 'vue-tsc' $rest
+}}
+function eslint {{
+  $rest = @(_kds_restore_args $args $MyInvocation.Statement)
+  _kds_wrap 'eslint' $rest
+}}
+function biome {{
+  $rest = @(_kds_restore_args $args $MyInvocation.Statement)
+  if ($rest.Count -gt 0 -and @('check','ci','lint') -contains $rest[0]) {{ _kds_wrap 'biome' $rest }} else {{ _kds_call_native 'biome' $rest }}
+}}
+function prettier {{
+  $rest = @(_kds_restore_args $args $MyInvocation.Statement)
+  $hasCheck = _kds_has_flag $rest @('--check','-c')
+  if ($hasCheck) {{ _kds_wrap 'prettier' $rest }} else {{ _kds_call_native 'prettier' $rest }}
+}}
+function vitest {{
+  $rest = @(_kds_restore_args $args $MyInvocation.Statement)
+  _kds_wrap 'vitest' $rest
+}}
+function jest {{
+  $rest = @(_kds_restore_args $args $MyInvocation.Statement)
+  _kds_wrap 'jest' $rest
+}}
+function playwright {{
+  $rest = @(_kds_restore_args $args $MyInvocation.Statement)
+  if ($rest.Count -gt 0 -and $rest[0] -eq 'test') {{ _kds_wrap 'playwright' $rest }} else {{ _kds_call_native 'playwright' $rest }}
+}}
+function ruff {{
+  $rest = @(_kds_restore_args $args $MyInvocation.Statement)
+  $hasCheck = _kds_has_flag $rest @('--check')
+  if ($rest.Count -gt 0 -and ($rest[0] -eq 'check' -or ($rest[0] -eq 'format' -and $hasCheck))) {{ _kds_wrap 'ruff' $rest }} else {{ _kds_call_native 'ruff' $rest }}
+}}
+function mypy {{
+  $rest = @(_kds_restore_args $args $MyInvocation.Statement)
+  _kds_wrap 'mypy' $rest
+}}
+function pyright {{
+  $rest = @(_kds_restore_args $args $MyInvocation.Statement)
+  _kds_wrap 'pyright' $rest
+}}
+function uv {{
+  $rest = @(_kds_restore_args $args $MyInvocation.Statement)
+  if ($rest.Count -ge 2 -and $rest[0] -eq 'run' -and (_kds_safe_python_module $rest[1])) {{ _kds_wrap 'uv' $rest }} else {{ _kds_call_native 'uv' $rest }}
+}}
+function dotnet {{
+  $rest = @(_kds_restore_args $args $MyInvocation.Statement)
+  if ($rest.Count -gt 0 -and @('test','build') -contains $rest[0]) {{ _kds_wrap 'dotnet' $rest }} else {{ _kds_call_native 'dotnet' $rest }}
+}}
+function go {{
+  $rest = @(_kds_restore_args $args $MyInvocation.Statement)
+  if ($rest.Count -gt 0 -and @('test','build') -contains $rest[0]) {{ _kds_wrap 'go' $rest }} else {{ _kds_call_native 'go' $rest }}
 }}
 {END}
 "#
@@ -294,7 +363,7 @@ mod tests {
         let block = hook_block().unwrap();
         assert!(block.contains("function KDS {"), "block:\n{block}");
         assert!(
-            block.contains("$kdsCommands = @('run','raw','gain','gc','prune','doctor','logs','evidence','init','hook','help')"),
+            block.contains("$kdsCommands = @('run','raw','summarize','gain','gc','prune','doctor','logs','evidence','init','hook','help')"),
             "block:\n{block}"
         );
         assert!(
@@ -302,7 +371,7 @@ mod tests {
             "block:\n{block}"
         );
         assert!(
-            block.contains("& $script:KdsCommand @kdsArgs"),
+            block.contains("& $global:KdsCommand @kdsArgs"),
             "block:\n{block}"
         );
         assert!(block.contains("KDS @kdsArgs"), "block:\n{block}");
@@ -435,8 +504,8 @@ function prompt {{ 'BASE> ' }}
             r#"
 {}
 $env:PATH = '{};' + $env:PATH
-$script:KdsExe = '{}'
-$script:KdsCommand = 'kds.cmd'
+$global:KdsExe = '{}'
+$global:KdsCommand = 'kds.cmd'
 "manual-kds-command"
 KDS gain
 "manual-kds-wrap"
@@ -456,14 +525,20 @@ git diff --exit-code
 npm test
 "npm-run-test"
 npm run test
+"npm-run-test-fast"
+npm run test-fast
 "npm-run-deploy"
 npm run deploy
 "pnpm-run-build"
 pnpm run build
+"pnpm-run-build-local"
+pnpm run build-local
 "pnpm-run-deploy"
 pnpm run deploy
 "just-test"
 just test
+"just-test-fast"
+just test-fast
 "just-deploy"
 just deploy
 "python-pytest"
@@ -549,6 +624,13 @@ python scripts/test_publish_local_codex.py
             "stdout:\n{stdout}"
         );
         assert!(
+            stdout.contains(
+                "npm-run-test-fast\r\nkds:[--]\r\nkds:[npm]\r\nkds:[run]\r\nkds:[test-fast]"
+            ) || stdout
+                .contains("npm-run-test-fast\nkds:[--]\nkds:[npm]\nkds:[run]\nkds:[test-fast]"),
+            "stdout:\n{stdout}"
+        );
+        assert!(
             stdout.contains("npm-run-deploy\r\nnative:[run]\r\nnative:[deploy]")
                 || stdout.contains("npm-run-deploy\nnative:[run]\nnative:[deploy]"),
             "stdout:\n{stdout}"
@@ -559,6 +641,14 @@ python scripts/test_publish_local_codex.py
             "stdout:\n{stdout}"
         );
         assert!(
+            stdout.contains(
+                "pnpm-run-build-local\r\nkds:[--]\r\nkds:[pnpm]\r\nkds:[run]\r\nkds:[build-local]"
+            ) || stdout.contains(
+                "pnpm-run-build-local\nkds:[--]\nkds:[pnpm]\nkds:[run]\nkds:[build-local]"
+            ),
+            "stdout:\n{stdout}"
+        );
+        assert!(
             stdout.contains("pnpm-run-deploy\r\nnative:[run]\r\nnative:[deploy]")
                 || stdout.contains("pnpm-run-deploy\nnative:[run]\nnative:[deploy]"),
             "stdout:\n{stdout}"
@@ -566,6 +656,11 @@ python scripts/test_publish_local_codex.py
         assert!(
             stdout.contains("just-test\r\nkds:[--]\r\nkds:[just]\r\nkds:[test]")
                 || stdout.contains("just-test\nkds:[--]\nkds:[just]\nkds:[test]"),
+            "stdout:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("just-test-fast\r\nkds:[--]\r\nkds:[just]\r\nkds:[test-fast]")
+                || stdout.contains("just-test-fast\nkds:[--]\nkds:[just]\nkds:[test-fast]"),
             "stdout:\n{stdout}"
         );
         assert!(
@@ -588,6 +683,72 @@ python scripts/test_publish_local_codex.py
                 || stdout.contains("python-script\nnative:[scripts/test_publish_local_codex.py]"),
             "stdout:\n{stdout}"
         );
+    }
+
+    #[test]
+    fn powershell_hook_survives_strict_child_scripts() {
+        if !cfg!(windows) {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let fake_cargo = dir.path().join("cargo.cmd");
+        let fake_kds = dir.path().join("kds.cmd");
+        std::fs::write(&fake_cargo, "@echo off\r\necho native-cargo:[%*]\r\n").unwrap();
+        std::fs::write(
+            &fake_kds,
+            "@echo off\r\n:loop\r\nif \"%~1\"==\"\" goto end\r\necho kds:[%~1]\r\nshift\r\ngoto loop\r\n:end\r\n",
+        )
+        .unwrap();
+
+        let profile_path = dir.path().join("profile.ps1");
+        std::fs::write(&profile_path, hook_block().unwrap()).unwrap();
+
+        let child_path = dir.path().join("strict-child.ps1");
+        std::fs::write(
+            &child_path,
+            r#"
+Set-StrictMode -Version Latest
+"strict-child"
+cargo test
+"after-cargo"
+"#,
+        )
+        .unwrap();
+
+        let output = match Command::new("pwsh")
+            .arg("-NoProfile")
+            .arg("-ExecutionPolicy")
+            .arg("Bypass")
+            .arg("-Command")
+            .arg(format!(
+                ". '{}'; $env:PATH = '{};' + $env:PATH; $global:KdsExe = '{}'; $global:KdsCommand = 'kds.cmd'; & '{}'",
+                profile_path.display(),
+                dir.path().display(),
+                fake_kds.display(),
+                child_path.display()
+            ))
+            .output()
+        {
+            Ok(output) => output,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+            Err(err) => panic!("run pwsh: {err}"),
+        };
+
+        assert!(
+            output.status.success(),
+            "stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("strict-child\r\nkds:[--]\r\nkds:[cargo]\r\nkds:[test]\r\nafter-cargo")
+                || stdout.contains("strict-child\nkds:[--]\nkds:[cargo]\nkds:[test]\nafter-cargo"),
+            "stdout:\n{stdout}"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stderr.contains("KdsCommand"), "stderr:\n{stderr}");
     }
 
     #[test]
@@ -625,8 +786,8 @@ function cargo {{ "user-cargo-function" }}
 function npm {{ "user-npm-function" }}
 {}
 $env:PATH = '{};' + $env:PATH
-$script:KdsExe = '{}'
-$script:KdsCommand = 'kds.cmd'
+$global:KdsExe = '{}'
+$global:KdsCommand = 'kds.cmd'
 "cargo-run-native"
 cargo run
 "cargo-check-wrapped"

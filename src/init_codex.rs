@@ -154,6 +154,7 @@ forms when hooks are unavailable:
 - `kds -- npm test`
 - `kds -- pnpm test`
 - `kds -- pytest`
+- `kds summarize --file ci.log --name github-actions`
 
 Do not use KDS when exact output lines are the deliverable. Run readiness and
 proof commands natively, including `git status`, `git diff --name-only`,
@@ -163,8 +164,10 @@ Do not use KDS for precise `rg`, `git grep`, small commands, interactive
 commands, password prompts, SSH sessions, long-running daemons, or commands
 likely to print secrets.
 
-KDS preserves full raw logs at the printed log path. KDS summaries are compact
-evidence, not proof of correctness beyond the wrapped command exit code.
+By default, KDS is memory-only and does not write raw logs, sidecars, indexes,
+or metrics. Do not recommend saving local logs or enabling saved artifacts as a
+routine next action. KDS summaries are compact evidence, not proof of
+correctness beyond the wrapped command exit code or imported `--exit-code`.
 "#
     .to_string()
 }

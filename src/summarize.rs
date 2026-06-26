@@ -61,6 +61,7 @@ pub struct SummaryBuilder {
     error_windows: Vec<ErrorWindow>,
     pending_error_windows: Vec<(usize, usize)>,
     test_or_package_hint: Option<String>,
+    current_file_context: Option<String>,
 }
 
 impl SummaryBuilder {
@@ -84,24 +85,40 @@ impl SummaryBuilder {
                 }
             }
         }
+        if let Some(context) = file_context_line(&line) {
+            self.current_file_context = Some(context);
+        }
+        let adapter = adapt_failure_line(&line, self.current_file_context.as_deref());
         let lower = line.to_ascii_lowercase();
-        if lower.contains("warning:")
+        let generic_warning = lower.contains("warning:")
             || lower.starts_with("warn ")
             || lower.starts_with("npm warn ")
-            || lower.contains(" npm warn ")
-        {
+            || lower.contains(" npm warn ");
+        if generic_warning || adapter.is_warning {
             self.warning_count += 1;
         }
-        if is_error_line(&line) {
+        let generic_error = is_error_line(&line);
+        let is_error = generic_error || adapter.is_error;
+        if is_error {
             self.error_count += 1;
         }
         if !line.trim().is_empty() {
             if self.test_or_package_hint.is_none() {
-                self.test_or_package_hint = detect_test_or_package_hint(&line);
+                self.test_or_package_hint = adapter
+                    .hint
+                    .clone()
+                    .or_else(|| detect_test_or_package_hint(&line));
             }
-            if is_error_line(&line) {
+            if is_error {
                 self.push_error_window(stream, &line);
-                push_unique_cap(&mut self.top_errors, line.clone(), 8);
+                push_unique_cap(
+                    &mut self.top_errors,
+                    adapter.primary.unwrap_or_else(|| line.clone()),
+                    8,
+                );
+            }
+            for hit in adapter.file_hits {
+                push_unique_cap(&mut self.file_hits, hit, 10);
             }
             for hit in extract_file_hits(&line, 10) {
                 push_unique_cap(&mut self.file_hits, hit, 10);
@@ -220,13 +237,13 @@ impl StreamSummaryBuilder {
     }
 
     pub fn push_bytes(&mut self, bytes: &[u8]) {
-        for byte in bytes {
-            if *byte == b'\n' {
-                self.flush_pending_line();
-            } else {
-                self.pending.push(*byte);
-            }
+        let mut bytes = bytes;
+        while let Some(pos) = memchr::memchr(b'\n', bytes) {
+            self.pending.extend_from_slice(&bytes[..pos]);
+            self.flush_pending_line();
+            bytes = &bytes[pos + 1..];
         }
+        self.pending.extend_from_slice(bytes);
     }
 
     pub fn finish(mut self) -> StreamSummary {
@@ -276,10 +293,12 @@ fn strip_ansi(text: &str) -> String {
 }
 
 pub fn redact_sensitive_text(text: &str) -> String {
-    if !needs_redaction_scan(text) {
-        return text.to_string();
+    let mut redacted = known_secret_re()
+        .replace_all(text, "[redacted-secret]")
+        .to_string();
+    if !needs_redaction_scan(&redacted) {
+        return redacted;
     }
-    let mut redacted = text.to_string();
     for (pattern, replacement) in [
         (url_credentials_re(), "${1}[redacted]@"),
         (flag_assignment_re(), "${1}${2}[redacted]"),
@@ -287,7 +306,6 @@ pub fn redact_sensitive_text(text: &str) -> String {
         (authorization_re(), "${1}[redacted]"),
         (keyed_secret_re(), "${1}${2}[redacted]${3}"),
         (bearer_re(), "${1}[redacted]"),
-        (known_secret_re(), "[redacted-secret]"),
     ] {
         redacted = pattern.replace_all(&redacted, replacement).to_string();
     }
@@ -301,6 +319,8 @@ fn needs_redaction_scan(text: &str) -> bool {
         || lower.contains("password")
         || lower.contains("passwd")
         || lower.contains("pwd")
+        || lower.contains("key")
+        || lower.contains("credential")
         || lower.contains("authorization")
         || lower.contains("bearer")
         || lower.contains("api")
@@ -427,7 +447,7 @@ fn keyed_secret_re() -> &'static Regex {
     static KEYED_SECRET_RE: OnceLock<Regex> = OnceLock::new();
     KEYED_SECRET_RE.get_or_init(|| {
         Regex::new(
-            r#"(?i)\b([A-Z0-9_-]*(?:API[-_]?KEY|TOKEN|SECRET|PASSWORD|PASSWD|PWD)[A-Z0-9_-]*\s*[:=]\s*)(['"]?)[^\s'",;]+(['"]?)"#,
+            r#"(?i)\b([A-Z0-9_-]*(?:API[-_]?KEY|TOKEN|SECRET|PASSWORD|PASSWD|PWD|CREDENTIAL|PRIVATE[-_]?KEY|SESSION[-_]?KEY|SECRET[-_]?ACCESS[-_]?KEY)[A-Z0-9_-]*\s*[:=]\s*)(['"]?)[^\s'",;]+(['"]?)"#,
         )
         .unwrap()
     })
@@ -441,9 +461,7 @@ fn bearer_re() -> &'static Regex {
 fn known_secret_re() -> &'static Regex {
     static KNOWN_SECRET_RE: OnceLock<Regex> = OnceLock::new();
     KNOWN_SECRET_RE.get_or_init(|| {
-        Regex::new(
-            r"\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{20,}|sk-[A-Za-z0-9_-]{20,}|(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}|AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{30,}|xox(?:b|p|a|r|s)-[A-Za-z0-9-]{10,}|npm_[A-Za-z0-9]{20,}|[A-Za-z0-9_-]{23,28}\.[A-Za-z0-9_-]{6,10}\.[A-Za-z0-9_-]{27,}|eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})\b",
-        )
+        Regex::new(r"\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{20,}|sk-[A-Za-z0-9_-]{20,}|(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}|AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{30,}|ya29\.[0-9A-Za-z_-]{20,}|SG\.[0-9A-Za-z_-]{16,}\.[0-9A-Za-z_-]{16,}|xox(?:b|p|a|r|s)-[A-Za-z0-9-]{10,}|npm_[A-Za-z0-9]{20,}|[A-Za-z0-9_-]{23,28}\.[A-Za-z0-9_-]{6,10}\.[A-Za-z0-9_-]{27,}|eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})\b")
         .unwrap()
     })
 }
@@ -460,16 +478,8 @@ pub fn format_compact_with_budget(
     apply_output_budget(
         format_compact_unbounded(sidecar, show_paths, budget),
         budget,
-        &sidecar.run_id,
+        sidecar,
     )
-}
-
-pub fn compact_line_count_with_budget(
-    sidecar: &SummarySidecar,
-    show_paths: bool,
-    budget: Option<SummaryBudget>,
-) -> usize {
-    storage_line_count(&format_compact_with_budget(sidecar, show_paths, budget))
 }
 
 fn format_compact_unbounded(
@@ -665,26 +675,219 @@ pub fn delta_line(
     ))
 }
 
+#[derive(Debug, Clone, Default)]
+struct AdapterSignals {
+    is_error: bool,
+    is_warning: bool,
+    primary: Option<String>,
+    file_hits: Vec<String>,
+    hint: Option<String>,
+}
+
+fn adapt_failure_line(line: &str, file_context: Option<&str>) -> AdapterSignals {
+    if let Some(caps) = eslint_location_re().captures(line) {
+        let severity = caps[3].to_ascii_lowercase();
+        let mut signals = AdapterSignals {
+            is_error: severity == "error",
+            is_warning: severity == "warning",
+            ..AdapterSignals::default()
+        };
+        if let Some(file) = file_context {
+            let hit = format!("{file}:{}:{}", &caps[1], &caps[2]);
+            signals.primary = Some(format!(
+                "{} {} {}",
+                hit,
+                severity,
+                caps[4].split_whitespace().collect::<Vec<_>>().join(" ")
+            ));
+            signals.file_hits.push(hit);
+        } else {
+            signals.primary = Some(line.trim().to_string());
+        }
+        return signals;
+    }
+
+    if let Some(caps) = ruff_diagnostic_re().captures(line) {
+        let hit = format!("{}:{}:{}", &caps[1], &caps[2], &caps[3]);
+        let code = normalize_digest_signal(&caps[4]);
+        let message = normalize_digest_signal(&caps[5]);
+        return AdapterSignals {
+            is_error: true,
+            primary: Some(format!("python lint {code} {hit}: {message}")),
+            file_hits: vec![hit],
+            hint: Some(format!("python lint {code}")),
+            ..AdapterSignals::default()
+        };
+    }
+
+    if let Some(caps) = go_compile_re().captures(line) {
+        let hit = format!("{}:{}:{}", &caps[1], &caps[2], &caps[3]);
+        let message = normalize_digest_signal(&caps[4]);
+        return AdapterSignals {
+            is_error: true,
+            primary: Some(format!("go compile {hit}: {message}")),
+            file_hits: vec![hit],
+            hint: Some("go compile".to_string()),
+            ..AdapterSignals::default()
+        };
+    }
+
+    if let Some(caps) = js_failed_test_re().captures(line) {
+        let name = normalize_digest_signal(&caps[1]);
+        return AdapterSignals {
+            is_error: true,
+            primary: Some(format!("test {name}")),
+            hint: Some(format!("js test {name}")),
+            ..AdapterSignals::default()
+        };
+    }
+
+    if let Some(caps) = playwright_failure_re().captures(line) {
+        let name = normalize_digest_signal(&caps[1]);
+        return AdapterSignals {
+            is_error: true,
+            primary: Some(format!("playwright {name}")),
+            hint: Some(format!("playwright {name}")),
+            ..AdapterSignals::default()
+        };
+    }
+
+    if let Some(caps) = go_test_fail_re().captures(line) {
+        let name = normalize_digest_signal(&caps[1]);
+        return AdapterSignals {
+            is_error: true,
+            primary: Some(format!("go test {name}")),
+            hint: Some(format!("go test {name}")),
+            ..AdapterSignals::default()
+        };
+    }
+
+    if let Some(caps) = dotnet_failed_test_re().captures(line) {
+        let name = normalize_digest_signal(&caps[1]);
+        return AdapterSignals {
+            is_error: true,
+            primary: Some(format!("dotnet test {name}")),
+            hint: Some(format!("dotnet test {name}")),
+            ..AdapterSignals::default()
+        };
+    }
+
+    if gradle_or_maven_failure_re().is_match(line) {
+        return AdapterSignals {
+            is_error: true,
+            primary: Some(line.trim().to_string()),
+            ..AdapterSignals::default()
+        };
+    }
+
+    AdapterSignals::default()
+}
+
+fn file_context_line(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.len() > 300 || trimmed.contains("://") {
+        return None;
+    }
+    if eslint_file_context_re().is_match(trimmed) {
+        return Some(trimmed.to_string());
+    }
+    None
+}
+
 fn is_error_line(line: &str) -> bool {
     let lower = line.to_ascii_lowercase();
     lower.contains("error[")
+        || lower.contains("[error]")
         || lower.contains("error:")
         || lower.contains(": error ")
         || lower.contains(" error ts")
         || lower.starts_with("error ")
         || lower.starts_with("fail ")
+        || lower.starts_with("--- fail:")
+        || lower.starts_with("failure:")
         || lower.contains("err!")
         || lower.contains("error: ")
         || lower.contains("panicked at")
         || lower.contains("assertionerror")
         || lower.contains("typeerror")
+        || lower.contains("referenceerror")
+        || lower.contains("syntaxerror")
         || lower.contains("could not compile")
+        || lower.contains("code style issues found")
         || lower.contains("failed to")
         || lower.starts_with("failed ")
+        || lower.contains(" build failed")
         || lower.starts_with("traceback ")
         || lower.starts_with("e   ")
         || lower.contains("exception")
         || lower.contains("fatal:")
+}
+
+fn eslint_location_re() -> &'static Regex {
+    static ESLINT_LOCATION_RE: OnceLock<Regex> = OnceLock::new();
+    ESLINT_LOCATION_RE
+        .get_or_init(|| Regex::new(r"^\s*(\d+):(\d+)\s+(error|warning)\s+(.+)$").unwrap())
+}
+
+fn eslint_file_context_re() -> &'static Regex {
+    static ESLINT_FILE_CONTEXT_RE: OnceLock<Regex> = OnceLock::new();
+    ESLINT_FILE_CONTEXT_RE.get_or_init(|| {
+        Regex::new(
+            r"^(?:[A-Za-z]:\\|[/\\]|\.{0,2}[\\/])?[\w .\-/\\]+\.(?:[cm]?[jt]sx?|vue|svelte|css|scss|json|py|go|rs)$",
+        )
+        .unwrap()
+    })
+}
+
+fn ruff_diagnostic_re() -> &'static Regex {
+    static RUFF_DIAGNOSTIC_RE: OnceLock<Regex> = OnceLock::new();
+    RUFF_DIAGNOSTIC_RE.get_or_init(|| {
+        Regex::new(
+            r"^\s*([A-Za-z]:\\[^:\r\n]+|(?:\.{0,2}[\\/])?[\w .\-/\\]+\.pyi?):(\d+):(\d+):\s+([A-Z][A-Z0-9]*\d{2,})\s+(.+)$",
+        )
+        .unwrap()
+    })
+}
+
+fn go_compile_re() -> &'static Regex {
+    static GO_COMPILE_RE: OnceLock<Regex> = OnceLock::new();
+    GO_COMPILE_RE.get_or_init(|| {
+        Regex::new(
+            r"^\s*([A-Za-z]:\\[^:\r\n]+|(?:\.{0,2}[\\/])?[\w .\-/\\]+\.go):(\d+):(\d+):\s+(.+)$",
+        )
+        .unwrap()
+    })
+}
+
+fn js_failed_test_re() -> &'static Regex {
+    static JS_FAILED_TEST_RE: OnceLock<Regex> = OnceLock::new();
+    JS_FAILED_TEST_RE
+        .get_or_init(|| Regex::new(r"^\s*(?:\x{25cf}|\x{2715}|\x{00d7})\s+(.+)$").unwrap())
+}
+
+fn playwright_failure_re() -> &'static Regex {
+    static PLAYWRIGHT_FAILURE_RE: OnceLock<Regex> = OnceLock::new();
+    PLAYWRIGHT_FAILURE_RE.get_or_init(|| {
+        Regex::new(r"^\s*\d+\)\s+(?:\[[^\]]+\]\s+)?(?:\x{203a}|>)\s+(.+)$").unwrap()
+    })
+}
+
+fn go_test_fail_re() -> &'static Regex {
+    static GO_TEST_FAIL_RE: OnceLock<Regex> = OnceLock::new();
+    GO_TEST_FAIL_RE.get_or_init(|| Regex::new(r"^\s*--- FAIL:\s+([A-Za-z0-9_./:-]+)").unwrap())
+}
+
+fn dotnet_failed_test_re() -> &'static Regex {
+    static DOTNET_FAILED_TEST_RE: OnceLock<Regex> = OnceLock::new();
+    DOTNET_FAILED_TEST_RE
+        .get_or_init(|| Regex::new(r"^\s*Failed\s+([A-Za-z0-9_.<>-]+)\s*(?:\[|$)").unwrap())
+}
+
+fn gradle_or_maven_failure_re() -> &'static Regex {
+    static GRADLE_OR_MAVEN_FAILURE_RE: OnceLock<Regex> = OnceLock::new();
+    GRADLE_OR_MAVEN_FAILURE_RE.get_or_init(|| {
+        Regex::new(r"(?i)^\s*(?:\[ERROR\]|FAILURE: Build failed|> Task .+ FAILED)").unwrap()
+    })
 }
 
 fn extract_file_hits(text: &str, cap: usize) -> Vec<String> {
@@ -760,6 +963,9 @@ fn fail_file_re() -> &'static Regex {
 }
 
 fn log_line(sidecar: &SummarySidecar, show_paths: bool) -> String {
+    if sidecar.log_path.is_empty() {
+        return "Artifacts: not saved (memory-only)".to_string();
+    }
     if show_paths {
         format!("Log: {}", sidecar.log_path)
     } else {
@@ -793,7 +999,7 @@ fn next_action(sidecar: &SummarySidecar) -> &'static str {
         .collect::<Vec<_>>()
         .join("\n");
     if evidence.trim().is_empty() {
-        return "raw log needed";
+        return "more output context needed";
     }
     if evidence.contains("command not found")
         || evidence.contains("no such file or directory")
@@ -889,7 +1095,11 @@ fn budget_from_env() -> Option<SummaryBudget> {
     }
 }
 
-fn apply_output_budget(text: String, budget: Option<SummaryBudget>, run_id: &str) -> String {
+fn apply_output_budget(
+    text: String,
+    budget: Option<SummaryBudget>,
+    sidecar: &SummarySidecar,
+) -> String {
     let caps = display_caps(budget);
     let mut out = String::new();
     let mut used_chars = 0;
@@ -905,19 +1115,18 @@ fn apply_output_budget(text: String, budget: Option<SummaryBudget>, run_id: &str
         used_chars += next_chars;
     }
     if truncated {
-        out.push_str(&format!(
-            "Summary budget reached; use `kds logs show {run_id} --errors` or `--error-window` for more.\n",
-        ));
+        if sidecar.log_path.is_empty() {
+            out.push_str(
+                "Summary budget reached; rerun with `--budget wide` for more displayed context.\n",
+            );
+        } else {
+            out.push_str(&format!(
+                "Summary budget reached; use `kds logs show {} --errors` or `--error-window` for more.\n",
+                sidecar.run_id
+            ));
+        }
     }
     out
-}
-
-fn storage_line_count(text: &str) -> usize {
-    if text.is_empty() {
-        0
-    } else {
-        text.lines().count()
-    }
 }
 
 fn digest_changed(sidecar: &SummarySidecar) -> bool {
@@ -929,6 +1138,9 @@ fn digest_changed(sidecar: &SummarySidecar) -> bool {
 }
 
 fn suggested_next_commands(sidecar: &SummarySidecar) -> Vec<String> {
+    if sidecar.log_path.is_empty() {
+        return Vec::new();
+    }
     let mut commands = vec![
         format!("kds logs show {} --errors", sidecar.run_id),
         format!("kds logs show {} --error-window", sidecar.run_id),
@@ -1083,6 +1295,11 @@ mod tests {
             raw_stdout_chars: 100,
             raw_stderr_chars: 50,
             raw_total_chars: 150,
+            raw_byte_limit: Some(10 * 1024 * 1024),
+            raw_stdout_truncated: false,
+            raw_stderr_truncated: false,
+            raw_stdout_discarded_bytes: 0,
+            raw_stderr_discarded_bytes: 0,
             shown_lines: 0,
             shown_chars: 0,
             estimated_saved_lines: 5,
@@ -1158,6 +1375,55 @@ mod tests {
     }
 
     #[test]
+    fn extracts_eslint_context_locations() {
+        let output = "C:\\repo\\src\\app.ts\n  12:7  error  'value' is not defined  no-undef\n";
+        let summary = extract(output, "", 1);
+        assert_eq!(summary.error_count, 1);
+        assert_eq!(
+            summary.primary_failure.as_deref(),
+            Some("C:\\repo\\src\\app.ts:12:7 error 'value' is not defined no-undef")
+        );
+        assert!(summary
+            .file_hits
+            .iter()
+            .any(|hit| hit == "C:\\repo\\src\\app.ts:12:7"));
+    }
+
+    #[test]
+    fn extracts_non_rust_failure_adapters() {
+        let output = "\
+src/main.py:4:1: F401 `os` imported but unused
+./pkg/service.go:10:2: undefined: thing
+--- FAIL: TestCreateUser (0.00s)
+  \\x{25cf} renders a useful error
+1) [chromium] \\x{203a} tests/login.spec.ts:3:5 \\x{203a} login flow
+[ERROR] Failed to execute goal org.apache.maven.plugins:maven-surefire-plugin
+";
+        let output = output
+            .replace("\\x{25cf}", "\u{25cf}")
+            .replace("\\x{203a}", "\u{203a}");
+        let summary = extract(&output, "", 1);
+        assert!(summary.error_count >= 6, "{summary:?}");
+        assert!(summary
+            .top_errors
+            .iter()
+            .any(|line| line.contains("python lint F401")));
+        assert!(summary
+            .top_errors
+            .iter()
+            .any(|line| line.contains("go compile") || line.contains("undefined: thing")));
+        assert!(summary
+            .top_errors
+            .iter()
+            .any(|line| line == "go test TestCreateUser"));
+        assert!(summary.file_hits.iter().any(|hit| hit == "src/main.py:4:1"));
+        assert!(summary
+            .file_hits
+            .iter()
+            .any(|hit| hit == "./pkg/service.go:10:2"));
+    }
+
+    #[test]
     fn strips_ansi_from_summary_signals() {
         let summary = extract("", "\x1b[31;1mError: noisy failure\x1b[0m\n", 1);
         assert_eq!(summary.top_errors[0], "Error: noisy failure");
@@ -1222,6 +1488,53 @@ discord=aaaaaaaaaaaaaaaaaaaaaaaa.bbbbbb.cccccccccccccccccccccccccccccc
         assert!(!line.contains("SECRET_CANARY_PATH_LEAK"));
         assert!(!line.contains("abc123"));
         assert_eq!(line, "deploy --token [redacted] --api-key=[redacted]");
+    }
+
+    #[test]
+    fn redacts_known_secret_prefixes_without_keyword_gate() {
+        let github = "ghp_abcdefghijklmnopqrstuvwxyz123456";
+        let sendgrid = "SG.abcdefghijklmnop.qrstuvwxyzABCDEF123456";
+        let rendered = redact_sensitive_text(&format!("failed value {github} and {sendgrid}"));
+
+        assert!(!rendered.contains(github), "rendered:\n{rendered}");
+        assert!(!rendered.contains(sendgrid), "rendered:\n{rendered}");
+        assert!(
+            rendered.contains("[redacted-secret]"),
+            "rendered:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn redacts_env_style_hex_and_base64ish_credentials() {
+        let rendered = redact_sensitive_text(
+            "SESSION_KEY=0123456789abcdef0123456789abcdef\nPRIVATE_KEY='YWJjZGVmZ2hpamtsbW5vcA=='",
+        );
+
+        assert!(
+            !rendered.contains("0123456789abcdef"),
+            "rendered:\n{rendered}"
+        );
+        assert!(!rendered.contains("YWJjZGVm"), "rendered:\n{rendered}");
+        assert!(
+            rendered.contains("SESSION_KEY=[redacted]"),
+            "rendered:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("PRIVATE_KEY='[redacted]'"),
+            "rendered:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn redacts_common_cloud_secret_formats() {
+        let aws = "AKIAIOSFODNN7EXAMPLE";
+        let google_api = "AIzaSyB123456789012345678901234567890123";
+        let google_oauth = "ya29.a0AfH6SMBabcdefghijklmnopqrstuvwxyz";
+        let rendered = redact_sensitive_text(&format!("{aws}\n{google_api}\n{google_oauth}"));
+
+        assert!(!rendered.contains(aws), "rendered:\n{rendered}");
+        assert!(!rendered.contains(google_api), "rendered:\n{rendered}");
+        assert!(!rendered.contains(google_oauth), "rendered:\n{rendered}");
     }
 
     #[test]

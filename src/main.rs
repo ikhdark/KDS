@@ -4,6 +4,7 @@ mod doctor;
 mod evidence;
 mod gain;
 mod gc;
+mod hash;
 mod hook;
 mod init_codex;
 mod logs;

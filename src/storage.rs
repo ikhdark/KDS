@@ -11,9 +11,9 @@ use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-pub const SUMMARY_SCHEMA_VERSION: u32 = 4;
+pub const SUMMARY_SCHEMA_VERSION: u32 = 5;
 pub const INDEX_SCHEMA_VERSION: u32 = 1;
-pub const METRICS_SCHEMA_VERSION: u32 = 2;
+pub const METRICS_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone)]
 pub struct Paths {
@@ -90,6 +90,16 @@ pub struct SummarySidecar {
     pub raw_stderr_chars: usize,
     #[serde(default)]
     pub raw_total_chars: usize,
+    #[serde(default)]
+    pub raw_byte_limit: Option<u64>,
+    #[serde(default)]
+    pub raw_stdout_truncated: bool,
+    #[serde(default)]
+    pub raw_stderr_truncated: bool,
+    #[serde(default)]
+    pub raw_stdout_discarded_bytes: u64,
+    #[serde(default)]
+    pub raw_stderr_discarded_bytes: u64,
     pub shown_lines: usize,
     #[serde(default)]
     pub shown_chars: usize,
@@ -152,6 +162,8 @@ pub struct IndexEntry {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Metrics {
     pub metrics_schema_version: u32,
+    #[serde(default = "default_metrics_scope")]
+    pub metrics_scope: String,
     pub command_count: u64,
     pub raw_line_count: u64,
     pub shown_line_count: u64,
@@ -238,9 +250,24 @@ pub struct GcReport {
     pub deleted_bytes: u64,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct StateReconciliationReport {
+    pub index_entries_removed: usize,
+    pub latest_entries_rebuilt: usize,
+    pub digest_shards_removed: usize,
+    pub unresolved_digest_refs_removed: usize,
+}
+
 #[derive(Debug)]
 struct ArtifactInfo {
     path: PathBuf,
+    modified: SystemTime,
+    bytes: u64,
+}
+
+#[derive(Debug)]
+struct ArtifactGroup {
+    artifacts: Vec<ArtifactInfo>,
     modified: SystemTime,
     bytes: u64,
 }
@@ -344,6 +371,10 @@ fn cleanup_due(marker: &Path, interval: Duration) -> bool {
 
 fn default_capture_mode() -> String {
     "stdout/stderr piped".to_string()
+}
+
+fn default_metrics_scope() -> String {
+    "lifetime".to_string()
 }
 
 pub fn command_string(argv: &[String]) -> String {
@@ -768,6 +799,31 @@ fn count_digest_shards(path: &Path) -> usize {
     count
 }
 
+fn digest_state_paths(paths: &Paths) -> Vec<PathBuf> {
+    if !paths.digest_dir.exists() {
+        return Vec::new();
+    }
+    let Ok(first_level) = fs::read_dir(&paths.digest_dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in first_level.flatten() {
+        let child = entry.path();
+        if !child.is_dir() {
+            continue;
+        }
+        if let Ok(files) = fs::read_dir(&child) {
+            out.extend(
+                files
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json")),
+            );
+        }
+    }
+    out
+}
+
 pub fn log_stats(paths: &Paths) -> Result<LogStats> {
     let entries = read_index(paths);
     let mut stats = LogStats {
@@ -844,26 +900,169 @@ pub fn prune_to_max_artifact_bytes(
     if total <= max_bytes {
         return Ok(report);
     }
-    artifacts.sort_by_key(|artifact| artifact.modified);
+    let mut groups = artifact_groups(artifacts);
+    groups.sort_by_key(|group| group.modified);
     let mut remaining = total;
-    for artifact in artifacts {
+    for group in groups {
         if remaining <= max_bytes {
             break;
         }
-        report.matched_artifacts += 1;
-        report.matched_bytes += artifact.bytes;
-        remaining = remaining.saturating_sub(artifact.bytes);
+        report.matched_artifacts += group.artifacts.len();
+        report.matched_bytes += group.bytes;
+        remaining = remaining.saturating_sub(group.bytes);
         if !dry_run {
-            fs::remove_file(&artifact.path)
-                .with_context(|| format!("remove {}", artifact.path.display()))?;
-            report.deleted_artifacts += 1;
-            report.deleted_bytes += artifact.bytes;
+            for artifact in group.artifacts {
+                fs::remove_file(&artifact.path)
+                    .with_context(|| format!("remove {}", artifact.path.display()))?;
+                report.deleted_artifacts += 1;
+                report.deleted_bytes += artifact.bytes;
+            }
         }
     }
     if !dry_run {
         remove_empty_log_dirs(&root, &root)?;
     }
     Ok(report)
+}
+
+pub fn reconcile_state_after_artifact_cleanup(paths: &Paths) -> Result<StateReconciliationReport> {
+    with_state_lock(paths, || {
+        reconcile_state_after_artifact_cleanup_unlocked(paths)
+    })
+}
+
+fn reconcile_state_after_artifact_cleanup_unlocked(
+    paths: &Paths,
+) -> Result<StateReconciliationReport> {
+    let (entries, diagnostics) = read_index_with_diagnostics(paths);
+    let original_entries = entries.len();
+    let mut retained = Vec::new();
+    let mut latest = BTreeMap::new();
+
+    for entry in entries {
+        if read_sidecar(Path::new(&entry.summary_path)).is_err() {
+            continue;
+        }
+        latest.insert(
+            command_cache_key(&entry.argv, &entry.cwd),
+            LatestByCommandEntry {
+                run_id: entry.run_id.clone(),
+                summary_path: entry.summary_path.clone(),
+                exit_code: entry.exit_code,
+            },
+        );
+        retained.push(entry);
+    }
+
+    if diagnostics.present
+        && (retained.len() != original_entries
+            || diagnostics.malformed_lines > 0
+            || diagnostics.read_errors > 0)
+    {
+        write_index_unlocked(paths, &retained)?;
+    }
+    if paths.latest_by_command.exists() || !retained.is_empty() {
+        write_latest_by_command(paths, &latest)?;
+    }
+
+    let digest_shards_removed = retire_digest_shards_with_missing_logs(paths)?;
+    let unresolved_digest_refs_removed = reconcile_unresolved_digest_refs(paths)?;
+
+    Ok(StateReconciliationReport {
+        index_entries_removed: original_entries.saturating_sub(retained.len()),
+        latest_entries_rebuilt: latest.len(),
+        digest_shards_removed,
+        unresolved_digest_refs_removed,
+    })
+}
+
+fn write_index_unlocked(paths: &Paths, entries: &[IndexEntry]) -> Result<()> {
+    if let Some(parent) = paths.runs_index.parent() {
+        create_private_dir_all(parent)?;
+    }
+    let mut text = String::new();
+    for entry in entries {
+        text.push_str(&serde_json::to_string(entry)?);
+        text.push('\n');
+    }
+    write_text_atomic(&paths.runs_index, &text)
+}
+
+fn retire_digest_shards_with_missing_logs(paths: &Paths) -> Result<usize> {
+    let mut removed = 0;
+    for path in digest_state_paths(paths) {
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        let Some(log_path) = value
+            .get("previous_log_path")
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        if log_path.trim().is_empty() || log_artifact_retained(Path::new(log_path)) {
+            continue;
+        }
+        fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
+        removed += 1;
+    }
+    if removed > 0 && paths.digest_dir.exists() {
+        remove_empty_log_dirs(&paths.digest_dir, &paths.digest_dir)?;
+    }
+    Ok(removed)
+}
+
+fn log_artifact_retained(path: &Path) -> bool {
+    path.is_file() || compressed_log_path(path).is_some_and(|path| path.is_file())
+}
+
+fn compressed_log_path(path: &Path) -> Option<PathBuf> {
+    if path.extension().and_then(|ext| ext.to_str()) == Some("log") {
+        Some(path.with_extension("log.gz"))
+    } else {
+        None
+    }
+}
+
+fn reconcile_unresolved_digest_refs(paths: &Paths) -> Result<usize> {
+    let dir = paths.state_dir.join("unresolved-by-command");
+    if !dir.exists() {
+        return Ok(0);
+    }
+
+    let mut removed = 0;
+    for entry in fs::read_dir(&dir).with_context(|| format!("read {}", dir.display()))? {
+        let entry = entry.with_context(|| format!("read {}", dir.display()))?;
+        let path = entry.path();
+        if !entry
+            .file_type()
+            .with_context(|| format!("stat {}", path.display()))?
+            .is_file()
+            || path.extension().and_then(|ext| ext.to_str()) != Some("json")
+        {
+            continue;
+        }
+        let Some(values) = fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Vec<String>>(&text).ok())
+        else {
+            continue;
+        };
+        let original_len = values.len();
+        let retained = values
+            .into_iter()
+            .filter(|digest_path| Path::new(digest_path).is_file())
+            .collect::<Vec<_>>();
+        if retained.len() == original_len {
+            continue;
+        }
+        removed += original_len - retained.len();
+        write_json_atomic(&path, &retained)?;
+    }
+    Ok(removed)
 }
 
 pub fn compress_artifacts_older_than(paths: &Paths, older_than: Duration) -> Result<GcReport> {
@@ -1011,6 +1210,62 @@ fn collect_artifacts(root: &Path, path: &Path, artifacts: &mut Vec<ArtifactInfo>
         });
     }
     Ok(())
+}
+
+fn artifact_groups(artifacts: Vec<ArtifactInfo>) -> Vec<ArtifactGroup> {
+    let mut grouped: BTreeMap<PathBuf, Vec<ArtifactInfo>> = BTreeMap::new();
+    for artifact in artifacts {
+        grouped
+            .entry(artifact_group_key(&artifact.path))
+            .or_default()
+            .push(artifact);
+    }
+    grouped
+        .into_values()
+        .map(|artifacts| {
+            let modified = artifacts
+                .iter()
+                .map(|artifact| artifact.modified)
+                .min()
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            let bytes = artifacts.iter().map(|artifact| artifact.bytes).sum();
+            ArtifactGroup {
+                artifacts,
+                modified,
+                bytes,
+            }
+        })
+        .collect()
+}
+
+fn artifact_group_key(path: &Path) -> PathBuf {
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return path.to_path_buf();
+    };
+    if let Some(base) = artifact_temp_base(file_name) {
+        return artifact_group_key(&path.with_file_name(base));
+    }
+    let stem = file_name
+        .strip_suffix(".summary.json")
+        .or_else(|| file_name.strip_suffix(".log.gz"))
+        .or_else(|| file_name.strip_suffix(".log"))
+        .or_else(|| file_name.strip_suffix(".tmp"))
+        .unwrap_or(file_name);
+    path.with_file_name(stem)
+}
+
+fn artifact_temp_base(file_name: &str) -> Option<&str> {
+    let without_tmp = file_name.strip_suffix(".tmp")?;
+    let (before_unique, unique) = without_tmp.rsplit_once('.')?;
+    let (base, pid) = before_unique.rsplit_once('.')?;
+    if pid.chars().all(|ch| ch.is_ascii_digit())
+        && unique.chars().all(|ch| ch.is_ascii_digit())
+        && !base.is_empty()
+    {
+        Some(base)
+    } else {
+        None
+    }
 }
 
 fn gc_artifacts_in(
@@ -1210,7 +1465,7 @@ pub fn command_cache_key(argv: &[String], cwd: &str) -> String {
     hasher.update(command_identity(argv).as_bytes());
     hasher.update(b"\0");
     hasher.update(cwd.as_bytes());
-    format!("{:x}", hasher.finalize())
+    crate::hash::sha256_finalize_hex(hasher)
 }
 
 fn load_latest_by_command(paths: &Paths) -> BTreeMap<String, LatestByCommandEntry> {
@@ -1233,6 +1488,7 @@ pub fn load_metrics(paths: &Paths) -> Metrics {
         .and_then(|text| serde_json::from_str::<Metrics>(&text).ok())
         .unwrap_or_else(|| Metrics {
             metrics_schema_version: METRICS_SCHEMA_VERSION,
+            metrics_scope: default_metrics_scope(),
             ..Metrics::default()
         })
 }
@@ -1268,6 +1524,7 @@ pub fn record_run_state_unlocked(
 
 fn update_metrics_for_sidecar(metrics: &mut Metrics, sidecar: &SummarySidecar) {
     metrics.metrics_schema_version = METRICS_SCHEMA_VERSION;
+    metrics.metrics_scope = default_metrics_scope();
     metrics.command_count += 1;
     metrics.raw_line_count += sidecar.raw_total_lines as u64;
     metrics.shown_line_count += sidecar.shown_lines as u64;
@@ -1425,17 +1682,47 @@ fn write_private_atomic_bytes(path: &Path, tmp: &Path, bytes: &[u8]) -> Result<(
 }
 
 fn replace_file(tmp: &Path, path: &Path) -> Result<()> {
-    match fs::rename(tmp, path) {
-        Ok(()) => Ok(()),
-        Err(_err) if cfg!(windows) && path.exists() => {
-            fs::remove_file(path).with_context(|| format!("remove {}", path.display()))?;
-            fs::rename(tmp, path)
-                .with_context(|| format!("rename {} to {}", tmp.display(), path.display()))
-        }
-        Err(err) => {
-            Err(err).with_context(|| format!("rename {} to {}", tmp.display(), path.display()))
-        }
+    replace_file_impl(tmp, path)
+}
+
+#[cfg(windows)]
+fn replace_file_impl(tmp: &Path, path: &Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
+
+    extern "system" {
+        fn MoveFileExW(
+            existing_file_name: *const u16,
+            new_file_name: *const u16,
+            flags: u32,
+        ) -> i32;
     }
+
+    fn wide(path: &Path) -> Vec<u16> {
+        path.as_os_str().encode_wide().chain(Some(0)).collect()
+    }
+
+    let tmp_wide = wide(tmp);
+    let path_wide = wide(path);
+    let ok = unsafe {
+        MoveFileExW(
+            tmp_wide.as_ptr(),
+            path_wide.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if ok != 0 {
+        return Ok(());
+    }
+    Err(std::io::Error::last_os_error())
+        .with_context(|| format!("replace {} with {}", path.display(), tmp.display()))
+}
+
+#[cfg(not(windows))]
+fn replace_file_impl(tmp: &Path, path: &Path) -> Result<()> {
+    fs::rename(tmp, path).with_context(|| format!("rename {} to {}", tmp.display(), path.display()))
 }
 
 fn create_private_file_new(path: &Path) -> std::io::Result<fs::File> {
@@ -1522,7 +1809,7 @@ fn make_run_id(argv: &[String], cwd: &Path, started: DateTime<Local>) -> String 
             .to_rfc3339_opts(SecondsFormat::Nanos, true)
             .as_bytes(),
     );
-    let hash = format!("{:x}", hasher.finalize());
+    let hash = crate::hash::sha256_finalize_hex(hasher);
     format!("{stamp}-{slug}-{}", &hash[..6])
 }
 
@@ -1716,6 +2003,86 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_state_after_cleanup_removes_stale_artifact_refs() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(dir.path());
+        paths.ensure_runtime_dirs().unwrap();
+        let day = paths.logs_dir.join("2026-01-01");
+        fs::create_dir_all(&day).unwrap();
+        let argv = vec!["cargo".to_string(), "test".to_string()];
+        let retained_summary = day.join("retained.summary.json");
+        let missing_summary = day.join("missing.summary.json");
+        write_sidecar(
+            &retained_summary,
+            &test_sidecar("retained-run", "retained-digest"),
+        )
+        .unwrap();
+
+        let retained_entry =
+            test_index_entry("retained-run", &retained_summary, &argv, "C:/repo", 1);
+        let stale_entry = test_index_entry("stale-run", &missing_summary, &argv, "C:/repo", 1);
+        append_index(&paths, &retained_entry).unwrap();
+        append_index(&paths, &stale_entry).unwrap();
+
+        let mut latest = BTreeMap::new();
+        latest.insert(
+            command_cache_key(&argv, "C:/repo"),
+            LatestByCommandEntry {
+                run_id: "stale-run".into(),
+                summary_path: missing_summary.display().to_string(),
+                exit_code: 1,
+            },
+        );
+        write_latest_by_command(&paths, &latest).unwrap();
+
+        let digest_path = paths.digest_dir.join("aa").join("aa1111.json");
+        write_json_atomic(
+            &digest_path,
+            &serde_json::json!({
+                "digest": "aa1111",
+                "previous_log_path": day.join("missing.log").display().to_string()
+            }),
+        )
+        .unwrap();
+        let unresolved = paths
+            .state_dir
+            .join("unresolved-by-command")
+            .join("cmd.json");
+        write_json_atomic(
+            &unresolved,
+            &vec![
+                digest_path.display().to_string(),
+                paths
+                    .digest_dir
+                    .join("bb")
+                    .join("missing.json")
+                    .display()
+                    .to_string(),
+            ],
+        )
+        .unwrap();
+
+        let report = reconcile_state_after_artifact_cleanup(&paths).unwrap();
+
+        assert_eq!(report.index_entries_removed, 1);
+        assert_eq!(report.latest_entries_rebuilt, 1);
+        assert_eq!(report.digest_shards_removed, 1);
+        assert_eq!(report.unresolved_digest_refs_removed, 2);
+        let entries = read_index(&paths);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].run_id, "retained-run");
+        let latest = load_latest_by_command(&paths);
+        assert_eq!(
+            latest
+                .get(&command_cache_key(&argv, "C:/repo"))
+                .unwrap()
+                .run_id,
+            "retained-run"
+        );
+        assert!(!digest_path.exists());
+    }
+
+    #[test]
     fn invalid_metrics_and_digest_state_are_reported() {
         let dir = tempfile::tempdir().unwrap();
         std::env::set_var("KDS_HOME", dir.path());
@@ -1825,6 +2192,32 @@ mod tests {
         assert_eq!(&bytes[..2], &[0x1f, 0x8b]);
     }
 
+    #[test]
+    fn prune_to_max_artifact_bytes_deletes_run_groups() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(dir.path());
+        paths.ensure_runtime_dirs().unwrap();
+        let day = paths.logs_dir.join("2026-01-01");
+        fs::create_dir_all(&day).unwrap();
+        let old_log = day.join("aaa-old.log");
+        let old_sidecar = day.join("aaa-old.summary.json");
+        let old_temp = day.join("aaa-old.summary.json.123.456.tmp");
+        let new_log = day.join("zzz-new.log");
+        fs::write(&old_log, "old-log").unwrap();
+        fs::write(&old_sidecar, "old-sidecar").unwrap();
+        fs::write(&old_temp, "old-temp").unwrap();
+        fs::write(&new_log, "new-log").unwrap();
+
+        let max_bytes = fs::metadata(&new_log).unwrap().len();
+        let report = prune_to_max_artifact_bytes(&paths, max_bytes, false).unwrap();
+
+        assert_eq!(report.deleted_artifacts, 3);
+        assert!(!old_log.exists());
+        assert!(!old_sidecar.exists());
+        assert!(!old_temp.exists());
+        assert!(new_log.exists());
+    }
+
     fn test_paths(root: &Path) -> Paths {
         let logs_dir = root.join("logs");
         let state_dir = root.join("state");
@@ -1892,6 +2285,11 @@ mod tests {
             raw_stdout_chars: 0,
             raw_stderr_chars: 12,
             raw_total_chars: 12,
+            raw_byte_limit: Some(10 * 1024 * 1024),
+            raw_stdout_truncated: false,
+            raw_stderr_truncated: false,
+            raw_stdout_discarded_bytes: 0,
+            raw_stderr_discarded_bytes: 0,
             shown_lines: 1,
             shown_chars: 12,
             estimated_saved_lines: 0,

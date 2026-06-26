@@ -1,5 +1,6 @@
 use anyhow::{bail, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
 #[command(name = "kds")]
@@ -14,8 +15,10 @@ pub struct Cli {
 enum Command {
     /// Run a command through KDS explicitly.
     Run(WrappedCommand),
-    /// Print captured stdout then stderr while still recording logs and metrics.
+    /// Tee stdout/stderr live through KDS.
     Raw(WrappedCommand),
+    /// Summarize stdin or an existing log file.
+    Summarize(SummarizeArgs),
     /// Show estimated output reduction metrics.
     Gain,
     /// Remove old local KDS run artifacts.
@@ -40,8 +43,31 @@ pub struct WrappedCommand {
     pub show_paths: bool,
     #[arg(long, value_enum)]
     pub budget: Option<SummaryBudget>,
+    /// Persist local KDS artifacts for later logs/evidence/gain commands.
+    #[arg(long = "save-artifacts")]
+    pub save_artifacts: bool,
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub command: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct SummarizeArgs {
+    /// Read log text from this file instead of stdin.
+    #[arg(short, long)]
+    pub file: Option<PathBuf>,
+    /// Stable label for the imported log in KDS metadata.
+    #[arg(long)]
+    pub name: Option<String>,
+    /// Exit code to record for the imported output.
+    #[arg(long = "exit-code", default_value_t = 1)]
+    pub exit_code: i32,
+    #[arg(long)]
+    pub show_paths: bool,
+    #[arg(long, value_enum)]
+    pub budget: Option<SummaryBudget>,
+    /// Persist local KDS artifacts for later logs/evidence/gain commands.
+    #[arg(long = "save-artifacts")]
+    pub save_artifacts: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -169,6 +195,7 @@ pub fn run() -> Result<i32> {
             crate::runner::Mode::Compact,
             false,
             None,
+            false,
         );
     }
 
@@ -179,13 +206,16 @@ pub fn run() -> Result<i32> {
             crate::runner::Mode::Compact,
             args.show_paths,
             args.budget,
+            args.save_artifacts,
         ),
         Some(Command::Raw(args)) => crate::runner::run(
             args.command,
             crate::runner::Mode::Raw,
             args.show_paths,
             args.budget,
+            args.save_artifacts,
         ),
+        Some(Command::Summarize(args)) => crate::runner::summarize_import(args),
         Some(Command::Gain) => crate::gain::run(),
         Some(Command::Gc(args)) => crate::gc::run(args),
         Some(Command::Prune(args)) => crate::gc::run_prune(args),

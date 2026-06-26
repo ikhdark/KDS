@@ -12,6 +12,7 @@ pub fn run() -> Result<i32> {
     };
 
     println!("KDS usage savings");
+    println!("Metric scope: {}", metrics.metrics_scope);
     println!("Commands cleaned up: {}", metrics.command_count);
     println!("Usage savings: {:.1}%", percent);
     println!(
