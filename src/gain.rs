@@ -5,21 +5,30 @@ use crate::storage::{self, CommandMetrics};
 pub fn run() -> Result<i32> {
     let paths = storage::Paths::discover()?;
     let metrics = storage::load_metrics(&paths);
-    let percent = if metrics.raw_line_count == 0 {
-        0.0
-    } else {
-        (metrics.estimated_saved_lines as f64 / metrics.raw_line_count as f64) * 100.0
-    };
+    let token_percent = percent(metrics.approx_saved_tokens, metrics.approx_raw_tokens);
+    let char_percent = percent(metrics.estimated_saved_chars, metrics.raw_char_count);
+    let line_percent = percent(metrics.estimated_saved_lines, metrics.raw_line_count);
 
     println!("KDS usage savings");
     println!("Metric scope: {}", metrics.metrics_scope);
     println!("Commands cleaned up: {}", metrics.command_count);
-    println!("Usage savings: {:.1}%", percent);
     println!(
-        "Approx token reduction: {} saved of {} raw (~{} shown)",
-        metrics.approx_saved_tokens, metrics.approx_raw_tokens, metrics.approx_shown_tokens
+        "Estimated token savings: {:.1}% (~{} saved of ~{} raw)",
+        token_percent, metrics.approx_saved_tokens, metrics.approx_raw_tokens
     );
-    println!("Full logs saved locally: yes");
+    println!("Char savings: {:.1}%", char_percent);
+    println!("Line savings: {:.1}%", line_percent);
+    println!(
+        "Artifacts counted: {} saved, {} memory-only",
+        metrics.saved_artifact_count, metrics.memory_only_count
+    );
+    if metrics.saved_artifact_count == 0 {
+        println!("Run-level drilldown: unavailable for memory-only runs");
+    } else if metrics.memory_only_count == 0 {
+        println!("Run-level drilldown: saved artifacts only");
+    } else {
+        println!("Run-level drilldown: saved artifacts only; memory-only runs are aggregate-only");
+    }
     println!("Raw command output: {} lines", metrics.raw_line_count);
     println!("Codex saw: {} summary lines", metrics.shown_line_count);
     println!("Raw command output: {} chars", metrics.raw_char_count);
@@ -51,6 +60,14 @@ pub fn run() -> Result<i32> {
     print_kind_percentiles(&metrics.per_command_kind_stats);
     print_low_value_wraps(&metrics.per_command);
     Ok(0)
+}
+
+fn percent(saved: u64, raw: u64) -> f64 {
+    if raw == 0 {
+        0.0
+    } else {
+        (saved as f64 / raw as f64) * 100.0
+    }
 }
 
 fn print_top(

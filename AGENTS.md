@@ -47,13 +47,16 @@ KDS is a standalone public Rust CLI. Keep this repository independent from
 - Do not install, vendor, shell out to, copy, or depend on another command
   wrapping tool.
 - Mention other command wrapping tools only as install/adoption UX inspiration.
-- Treat compact summaries as the default product surface. Treat sidecars,
-  indexes, evidence packs, gain metrics, and raw logs as saved-artifact surfaces.
+- Treat compact summaries and aggregate gain metrics as the default product
+  surface. Treat sidecars, indexes, evidence packs, per-command saved-run
+  metrics, and raw logs as saved-artifact surfaces.
 - Do not write raw logs, temp stdout/stderr files, sidecars, run indexes, or
-  metrics by default. Saved artifacts are permitted only when
-  `--save-artifacts` or `KDS_SAVE_ARTIFACTS=1` is explicitly set. In
-  saved-artifact mode, cap persisted raw bytes per stream while continuing to
-  drain child output and writing a truncation note.
+  repeat-failure tracking state by default. Default runs may write
+  aggregate-only gain metrics without run IDs, local paths, sidecars, or command
+  strings. Saved artifacts are permitted only when `--save-artifacts` or
+  `KDS_SAVE_ARTIFACTS=1` is explicitly set. In saved-artifact mode, cap
+  persisted raw bytes per stream while continuing to drain child output and
+  writing a truncation note.
 - Do not suggest saving logs or enabling saved artifacts as routine guidance,
   next actions, or default troubleshooting steps. Treat saved artifacts as an
   explicit user-directed opt-in only.
@@ -74,6 +77,10 @@ KDS is a standalone public Rust CLI. Keep this repository independent from
 - The hook may wrap noisy non-interactive verification commands through
   built-in profiles for JavaScript/TypeScript, Python, Go, Java/Kotlin, .NET,
   PHP, Ruby, Elixir, C/C++, and common task runners.
+- Cargo commands must run natively through automatic hooks so Rust validation
+  output stays exact and Cargo manages its own target-directory locks. Explicit
+  `KDS -- cargo ...` remains supported when the user deliberately asks for KDS
+  wrapping.
 - Safe package, recipe, and task categories are `test`, `build`, `check`,
   `lint`, `typecheck`, `format-check`, `ci`, `clippy`, `vet`, and `compile`.
   Other task names should run natively unless a profile explicitly proves they
@@ -114,8 +121,8 @@ KDS is a standalone public Rust CLI. Keep this repository independent from
   during tests.
 - Keep command output exact when exact lines are the deliverable. Run readiness
   evidence natively, including `git status`, `git diff --name-only`,
-  `git diff --check`, tracked diff hash commands, and publish/install
-  proof-line extraction.
+  `git diff --check`, tracked diff hash commands, Cargo validation commands,
+  and publish/install proof-line extraction.
 - When changing CLI behavior, update `README.md` and the relevant docs under
   `docs/`.
 - When changing sidecar, index, metrics, digest, or retention formats, update

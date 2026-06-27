@@ -26,6 +26,8 @@ Scope: `tests/`.
   metrics updates, digest shards, repeated-failure output, safe drilldown, spawn
   failures, stale temp cleanup, and truncation.
 - Preserve exact-output passthrough coverage for proof-style Git commands.
+- Preserve hook coverage proving Cargo commands run natively while other
+  allowlisted noisy commands still route through KDS.
 - Assert that safe commands do not print raw stdout/stderr bodies unless the
   behavior is explicitly live raw-mode output.
 - Assert that default summary output does not suggest enabling saved artifacts

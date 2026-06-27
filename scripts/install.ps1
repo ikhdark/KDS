@@ -167,7 +167,11 @@ function Set-KdsFileContentAtomic {
 
   try {
     if (Test-Path -LiteralPath $Path -PathType Leaf) {
-      [System.IO.File]::Replace($tmp, $Path, $null, $true)
+      $replaceBackup = Get-KdsUniqueSiblingPath $Path "replace-backup"
+      [System.IO.File]::Replace($tmp, $Path, $replaceBackup, $true)
+      if (Test-Path -LiteralPath $replaceBackup -PathType Leaf) {
+        Remove-Item -LiteralPath $replaceBackup -Force
+      }
     } else {
       [System.IO.File]::Move($tmp, $Path)
     }
@@ -396,9 +400,6 @@ function Test-KdsProfileShouldWrap {
   )
   $command = ([string]$Name).ToLowerInvariant()
   switch ($command) {
-    'cargo' {
-      return ($Argv.Count -gt 0 -and @('check','test','build','clippy') -contains ([string]$Argv[0]).ToLowerInvariant())
-    }
     { @('just','make','task') -contains $_ } {
       return (Test-KdsScriptProfile $Argv)
     }
@@ -841,15 +842,24 @@ KDS Windows installer
 Usage:
   ./scripts/install.ps1 [--dry-run] [--no-hook] [--help]
 
-Behavior:
+KDS turns long build and test output into a short, useful summary.
+It helps you and AI coding tools see what failed, which files matter, and what to check next without dumping hundreds of log lines into the chat.
+
+This installs KDS for your Windows user account.
+It builds KDS locally, adds kds.exe to your user PATH, and turns on automatic summaries for supported PowerShell and Codex Desktop build/test commands.
+You need Rust installed first because KDS does not download Rust or a prebuilt app.
+
+What changes?
+  KDS will:
+  - install kds.exe under %LOCALAPPDATA%\CodexKD\bin
+  - add that folder to your user PATH
+  - add a managed PowerShell hook unless --no-hook is set
+  - update Codex Desktop hooks when it finds a Codex home
+  - back up files before changing them
+
+Technical details:
   - prints installed and source versions before building
   - builds KDS from this repository
-  - requires Rust/Cargo to already be available on PATH
-  - never downloads or installs Rust/Cargo
-  - installs kds.exe to %LOCALAPPDATA%\CodexKD\bin
-  - adds the install directory to the user PATH when missing
-  - installs the automatic PowerShell hook by default unless --no-hook is set
-  - installs or updates a Codex Desktop PreToolUse hook for detected Codex homes
 "@ | Write-Host
   exit 0
 }
@@ -864,6 +874,9 @@ $installedVersion = Get-KdsInstalledVersion $targetExe
 $sourceVersion = Get-KdsSourceVersion $repo
 
 Write-Host "KDS install plan"
+Write-Host "This installs KDS for your Windows user account."
+Write-Host "It builds KDS locally, adds kds.exe to your user PATH, and turns on automatic summaries for supported PowerShell and Codex Desktop build/test commands."
+Write-Host "You need Rust installed first because KDS does not download Rust or a prebuilt app."
 Write-Host "Repository: $repo"
 Write-Host "Install directory: $installDir"
 Write-Host "Binary: $targetExe"

@@ -5,7 +5,9 @@ use std::path::PathBuf;
 #[derive(Debug, Parser)]
 #[command(name = "kds")]
 #[command(version)]
-#[command(about = "KD Savings: compact command evidence and local log drilldown")]
+#[command(
+    about = "KDS turns long build and test output into a short, useful summary.\nIt helps you and AI coding tools see what failed, which files matter, and what to check next without dumping hundreds of log lines into the chat."
+)]
 pub struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -21,13 +23,13 @@ enum Command {
     Summarize(SummarizeArgs),
     /// Show estimated output reduction metrics.
     Gain,
-    /// Remove old local KDS run artifacts.
+    /// Remove old saved KDS troubleshooting files.
     Clean(CleanArgs),
     /// Run read-only health checks.
     Doctor,
-    /// Inspect stored log metadata and safe sections.
+    /// Inspect saved KDS summary details.
     Logs(LogsArgs),
-    /// Print a tiny Codex handoff bundle.
+    /// Print a compact Codex handoff bundle.
     Evidence(EvidenceArgs),
     /// Manage Codex guidance.
     Init(InitArgs),
@@ -41,7 +43,10 @@ enum Command {
 pub struct WrappedCommand {
     #[arg(long)]
     pub show_paths: bool,
-    /// Persist local KDS artifacts for later logs/evidence/gain commands.
+    /// Summary size: auto keeps failures safer while shrinking known/success output.
+    #[arg(long, value_enum)]
+    pub budget: Option<SummaryBudget>,
+    /// Save local troubleshooting files for later logs/evidence/gain commands.
     #[arg(long = "save-artifacts")]
     pub save_artifacts: bool,
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -61,9 +66,31 @@ pub struct SummarizeArgs {
     pub exit_code: i32,
     #[arg(long)]
     pub show_paths: bool,
-    /// Persist local KDS artifacts for later logs/evidence/gain commands.
+    /// Summary size: auto keeps failures safer while shrinking known/success output.
+    #[arg(long, value_enum)]
+    pub budget: Option<SummaryBudget>,
+    /// Save local troubleshooting files for later logs/evidence/gain commands.
     #[arg(long = "save-artifacts")]
     pub save_artifacts: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum SummaryBudget {
+    Auto,
+    Tiny,
+    Normal,
+    Verbose,
+}
+
+impl SummaryBudget {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SummaryBudget::Auto => "auto",
+            SummaryBudget::Tiny => "tiny",
+            SummaryBudget::Normal => "normal",
+            SummaryBudget::Verbose => "verbose",
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -87,7 +114,7 @@ pub struct LogsArgs {
 
 #[derive(Debug, Args)]
 pub struct CleanArgs {
-    /// Remove artifacts older than this age, such as 30d, 12h, or 90m.
+    /// Remove saved KDS files older than this age, such as 30d, 12h, or 90m.
     #[arg(long = "older-than")]
     pub older_than: String,
 }
@@ -160,6 +187,7 @@ pub fn run() -> Result<i32> {
             raw_args.into_iter().skip(1).collect(),
             crate::runner::Mode::Compact,
             false,
+            None,
             false,
         );
     }
@@ -170,12 +198,14 @@ pub fn run() -> Result<i32> {
             args.command,
             crate::runner::Mode::Compact,
             args.show_paths,
+            args.budget.map(|budget| budget.as_str().to_string()),
             args.save_artifacts,
         ),
         Some(Command::Raw(args)) => crate::runner::run(
             args.command,
             crate::runner::Mode::Raw,
             args.show_paths,
+            args.budget.map(|budget| budget.as_str().to_string()),
             args.save_artifacts,
         ),
         Some(Command::Summarize(args)) => crate::runner::summarize_import(args),

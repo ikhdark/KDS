@@ -94,10 +94,12 @@ fn wraps_real_command_and_writes_local_run_artifacts() {
 
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.starts_with("KDS\n"), "stdout:\n{stdout}");
-    assert!(stdout.contains("Exit code: 0"), "stdout:\n{stdout}");
-    assert!(stdout.contains("Summary: success"), "stdout:\n{stdout}");
-    assert!(stdout.contains("Log: use `kds logs "), "stdout:\n{stdout}");
+    assert!(stdout.starts_with("KDS summary\n"), "stdout:\n{stdout}");
+    assert!(stdout.contains("Result: passed"), "stdout:\n{stdout}");
+    assert!(
+        stdout.contains("Saved logs: yes; inspect with `kds logs "),
+        "stdout:\n{stdout}"
+    );
     assert!(
         !stdout.contains(&kds_home.path().display().to_string()),
         "stdout:\n{stdout}"
@@ -131,6 +133,18 @@ fn wraps_real_command_and_writes_local_run_artifacts() {
         digest_shards.is_empty(),
         "successful run should not create failure digest shards"
     );
+    let metrics_path = kds_home.path().join("state").join("metrics.json");
+    let metrics: serde_json::Value =
+        serde_json::from_slice(&fs::read(&metrics_path).unwrap()).unwrap();
+    assert_eq!(metrics["saved_artifact_count"].as_u64(), Some(1));
+    assert_eq!(metrics["memory_only_count"].as_u64(), Some(0));
+    assert!(
+        metrics["per_command"]
+            .as_object()
+            .unwrap()
+            .contains_key("rustc --version"),
+        "saved metrics should retain command-level stats: {metrics}"
+    );
 
     let temp_files = collect_files(&kds_home.path().join("logs"), "tmp");
     assert!(temp_files.is_empty(), "temp files: {temp_files:?}");
@@ -150,17 +164,32 @@ fn default_run_does_not_write_local_artifacts() {
 
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.starts_with("KDS\n"), "stdout:\n{stdout}");
-    assert!(stdout.contains("Artifacts: not saved"), "stdout:\n{stdout}");
+    assert!(stdout.starts_with("KDS summary\n"), "stdout:\n{stdout}");
+    assert!(stdout.contains("Saved logs: no"), "stdout:\n{stdout}");
     assert!(!stdout.contains("--save-artifacts"), "stdout:\n{stdout}");
     assert!(!stdout.contains("logs/evidence"), "stdout:\n{stdout}");
     assert!(
         !kds_home.path().join("logs").exists(),
         "logs dir should not be created"
     );
+    let metrics_path = kds_home.path().join("state").join("metrics.json");
+    assert!(metrics_path.is_file(), "metrics should be aggregate-only");
+    let metrics: serde_json::Value =
+        serde_json::from_slice(&fs::read(&metrics_path).unwrap()).unwrap();
+    assert_eq!(metrics["memory_only_count"].as_u64(), Some(1));
+    assert_eq!(metrics["saved_artifact_count"].as_u64(), Some(0));
+    assert!(metrics["approx_raw_tokens"].as_u64().unwrap() > 0);
     assert!(
-        !kds_home.path().join("state").exists(),
-        "state dir should not be created"
+        metrics["per_command"].as_object().unwrap().is_empty(),
+        "memory-only metrics should not keep command strings: {metrics}"
+    );
+    assert!(
+        !kds_home.path().join("state").join("runs.jsonl").exists(),
+        "default run should not create saved-run index"
+    );
+    assert!(
+        !kds_home.path().join("state").join("digest").exists(),
+        "default run should not create digest shards"
     );
 }
 
@@ -189,19 +218,108 @@ fn default_summarize_does_not_write_local_artifacts() {
 
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.starts_with("KDS\n"), "stdout:\n{stdout}");
-    assert!(stdout.contains("Artifacts: not saved"), "stdout:\n{stdout}");
+    assert!(stdout.starts_with("KDS summary\n"), "stdout:\n{stdout}");
+    assert!(stdout.contains("Saved logs: no"), "stdout:\n{stdout}");
     assert!(!stdout.contains("--save-artifacts"), "stdout:\n{stdout}");
     assert!(!stdout.contains("logs/evidence"), "stdout:\n{stdout}");
-    assert!(stdout.contains("Exit code: 1"), "stdout:\n{stdout}");
+    assert!(
+        stdout.contains("Result: failed (exit code 1)"),
+        "stdout:\n{stdout}"
+    );
     assert!(stdout.contains("src/app.ts:12:7"), "stdout:\n{stdout}");
     assert!(
         !kds_home.path().join("logs").exists(),
         "logs dir should not be created"
     );
+    let metrics_path = kds_home.path().join("state").join("metrics.json");
+    assert!(metrics_path.is_file(), "metrics should be aggregate-only");
+    let metrics: serde_json::Value =
+        serde_json::from_slice(&fs::read(&metrics_path).unwrap()).unwrap();
+    assert_eq!(metrics["memory_only_count"].as_u64(), Some(1));
+    assert_eq!(metrics["saved_artifact_count"].as_u64(), Some(0));
     assert!(
-        !kds_home.path().join("state").exists(),
-        "state dir should not be created"
+        metrics["per_command"].as_object().unwrap().is_empty(),
+        "memory-only metrics should not keep command strings: {metrics}"
+    );
+    assert!(
+        !kds_home.path().join("state").join("runs.jsonl").exists(),
+        "default summarize should not create saved-run index"
+    );
+}
+
+#[test]
+fn successful_warning_summary_uses_compact_warning_layout() {
+    let kds_home = tempfile::tempdir().unwrap();
+    let input_dir = tempfile::tempdir().unwrap();
+    let log_path = input_dir.path().join("warnings.log");
+    fs::write(
+        &log_path,
+        "warning: unused variable `count`\nfinal successful line\n",
+    )
+    .unwrap();
+
+    let output = Command::new(kds_bin())
+        .env("KDS_HOME", kds_home.path())
+        .arg("summarize")
+        .arg("--file")
+        .arg(&log_path)
+        .arg("--name")
+        .arg("warning-log")
+        .arg("--exit-code")
+        .arg("0")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.starts_with("KDS summary\n"), "stdout:\n{stdout}");
+    assert!(
+        stdout.contains("Result: passed with warnings"),
+        "stdout:\n{stdout}"
+    );
+    assert!(stdout.contains("Top warnings:"), "stdout:\n{stdout}");
+    assert!(
+        stdout.contains("warning: unused variable"),
+        "stdout:\n{stdout}"
+    );
+    assert!(stdout.contains("Details: unavailable"), "stdout:\n{stdout}");
+    assert!(!stdout.contains("Last output shown:"), "stdout:\n{stdout}");
+}
+
+#[test]
+fn gain_reports_token_first_and_artifact_scope() {
+    let kds_home = tempfile::tempdir().unwrap();
+
+    let output = Command::new(kds_bin())
+        .env("KDS_HOME", kds_home.path())
+        .arg("--")
+        .arg("rustc")
+        .arg("--version")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+
+    let output = Command::new(kds_bin())
+        .env("KDS_HOME", kds_home.path())
+        .arg("gain")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Estimated token savings:"),
+        "stdout:\n{stdout}"
+    );
+    assert!(stdout.contains("Char savings:"), "stdout:\n{stdout}");
+    assert!(stdout.contains("Line savings:"), "stdout:\n{stdout}");
+    assert!(
+        stdout.contains("Artifacts counted: 0 saved, 1 memory-only"),
+        "stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Run-level drilldown: unavailable for memory-only runs"),
+        "stdout:\n{stdout}"
     );
 }
 
@@ -231,12 +349,15 @@ fn summarizes_existing_log_file_into_safe_artifacts() {
 
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.starts_with("KDS\n"), "stdout:\n{stdout}");
+    assert!(stdout.starts_with("KDS summary\n"), "stdout:\n{stdout}");
     assert!(
         stdout.contains("Command: kds-summarize ci-log"),
         "stdout:\n{stdout}"
     );
-    assert!(stdout.contains("Exit code: 1"), "stdout:\n{stdout}");
+    assert!(
+        stdout.contains("Result: failed (exit code 1)"),
+        "stdout:\n{stdout}"
+    );
     assert!(stdout.contains("src\\app.ts:12:7"), "stdout:\n{stdout}");
     assert!(!stdout.contains("SECRET_CANARY_VALUE"), "stdout:\n{stdout}");
     assert!(
@@ -321,6 +442,10 @@ fn proof_style_git_commands_pass_through_without_kds_artifacts() {
         vec!["rev-parse", "HEAD"],
         vec!["hash-object", "Cargo.toml"],
         vec!["log", "--oneline", "-1"],
+        vec!["show", "--stat", "HEAD"],
+        vec!["ls-files"],
+        vec!["describe", "--tags"],
+        vec!["tag", "--list"],
     ] {
         let output = Command::new(kds_bin())
             .env("KDS_HOME", kds_home.path())
@@ -337,7 +462,7 @@ fn proof_style_git_commands_pass_through_without_kds_artifacts() {
             stdout.contains(&format!("native-git:[{}]", args[0])),
             "stdout:\n{stdout}"
         );
-        assert!(!stdout.starts_with("KDS\n"), "stdout:\n{stdout}");
+        assert!(!stdout.starts_with("KDS summary\n"), "stdout:\n{stdout}");
     }
     let logs = collect_files(&kds_home.path().join("logs"), "log");
     assert!(logs.is_empty(), "logs: {logs:?}");
@@ -647,11 +772,11 @@ fn repeat_failures_use_short_compact_output_and_digest_shards() {
         second_stdout = String::from_utf8_lossy(&output.stdout).to_string();
     }
     assert!(
-        second_stdout.contains("Repeat: same failure signal as previous run"),
+        second_stdout.contains("Seen before: yes (same failure signal as previous run)"),
         "stdout:\n{second_stdout}"
     );
     assert!(
-        !second_stdout.contains("Final tail:"),
+        !second_stdout.contains("Last output shown:"),
         "stdout:\n{second_stdout}"
     );
     let digest_shards = collect_files(&kds_home.path().join("state").join("digest"), "json");
@@ -673,9 +798,9 @@ fn spawn_failure_writes_run_artifacts() {
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stdout.starts_with("KDS\n"), "stdout:\n{stdout}");
+    assert!(stdout.starts_with("KDS summary\n"), "stdout:\n{stdout}");
     assert!(
-        stdout.contains("failed; compact evidence follows"),
+        stdout.contains("Result: failed (exit code 1)"),
         "stdout:\n{stdout}"
     );
     assert!(
@@ -716,7 +841,7 @@ fn parallel_runs_keep_index_and_artifacts_consistent() {
         let output = handle.join().unwrap();
         assert!(output.status.success(), "{output:?}");
         let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(stdout.starts_with("KDS\n"), "stdout:\n{stdout}");
+        assert!(stdout.starts_with("KDS summary\n"), "stdout:\n{stdout}");
     }
 
     let logs = collect_files(&kds_home.path().join("logs"), "log");
@@ -760,8 +885,8 @@ fn wraps_windows_pathext_cmd_shim_end_to_end() {
 
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.starts_with("KDS\n"), "stdout:\n{stdout}");
-    assert!(stdout.contains("Exit code: 0"), "stdout:\n{stdout}");
+    assert!(stdout.starts_with("KDS summary\n"), "stdout:\n{stdout}");
+    assert!(stdout.contains("Result: passed"), "stdout:\n{stdout}");
 
     let logs = collect_files(&kds_home.path().join("logs"), "log");
     assert_eq!(logs.len(), 1, "logs: {logs:?}");

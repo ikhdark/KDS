@@ -153,18 +153,36 @@ explicit forms when hooks are unavailable:
 - `kds raw -- <verification command>`
 - `kds summarize --file ci.log --name github-actions`
 
-Do not use KDS when exact output lines are the deliverable. Run readiness and
-proof commands natively, including `git status`, `git diff --name-only`,
-`git diff --check`, tracked diff hash commands, and publish/install proof-line extraction.
+Use KDS for noisy commands where you mainly need to know what failed:
+
+- `npm test`
+- `pnpm build`
+- `cargo test`
+- `pytest`
+- `go test`
+- `dotnet test`
+
+Do not use KDS when the exact output is the thing you need to keep or share:
+
+- `git status`
+- `git diff`
+- `git diff --check`
+- commands that ask for passwords
+- SSH sessions
+- long-running dev servers
+- commands that may print secrets
+
+When in doubt, run the command normally.
 
 Do not use KDS for precise `rg`, `git grep`, small commands, interactive
 commands, password prompts, SSH sessions, long-running daemons, or commands
 likely to print secrets.
 
-By default, KDS is memory-only and does not write raw logs, sidecars, indexes,
-or metrics. Do not recommend saving local logs or enabling saved artifacts as a
-routine next action. KDS summaries are compact evidence, not proof of
-correctness beyond the wrapped command exit code or imported `--exit-code`.
+By default, KDS does not save command output. It only prints a short summary.
+To save local troubleshooting files for later, run with `--save-artifacts`.
+Do not recommend saving local logs as a routine next action. KDS summaries are
+not proof of correctness beyond the wrapped command exit code or imported
+`--exit-code`.
 
 KDS normal commands do not call the network. Use `kds update check` only when
 the user explicitly wants to check GitHub for the latest release.
@@ -207,12 +225,12 @@ mod tests {
         let guidance = kds_guidance();
         for expected in [
             "non-interactive build and test commands that spam logs",
-            "Do not use KDS when exact output lines are the deliverable",
+            "Do not use KDS when the exact output is the thing you need to keep or share",
             "`git status`",
-            "`git diff --name-only`",
+            "`git diff`",
             "`git diff --check`",
-            "tracked diff hash commands",
-            "publish/install proof-line extraction",
+            "When in doubt, run the command normally",
+            "By default, KDS does not save command output",
             "`kds update check`",
         ] {
             assert!(

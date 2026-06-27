@@ -11,9 +11,9 @@ use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-pub const SUMMARY_SCHEMA_VERSION: u32 = 5;
+pub const SUMMARY_SCHEMA_VERSION: u32 = 6;
 pub const INDEX_SCHEMA_VERSION: u32 = 1;
-pub const METRICS_SCHEMA_VERSION: u32 = 3;
+pub const METRICS_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Debug, Clone)]
 pub struct Paths {
@@ -120,6 +120,8 @@ pub struct SummarySidecar {
     pub primary_failure: Option<String>,
     pub delta: Option<String>,
     pub top_errors: Vec<String>,
+    #[serde(default)]
+    pub top_warnings: Vec<String>,
     pub file_hits: Vec<String>,
     pub tail: Vec<String>,
     pub suggested_next_reads: Vec<String>,
@@ -164,6 +166,10 @@ pub struct Metrics {
     pub metrics_schema_version: u32,
     #[serde(default = "default_metrics_scope")]
     pub metrics_scope: String,
+    #[serde(default)]
+    pub memory_only_count: u64,
+    #[serde(default)]
+    pub saved_artifact_count: u64,
     pub command_count: u64,
     pub raw_line_count: u64,
     pub shown_line_count: u64,
@@ -374,7 +380,7 @@ fn default_capture_mode() -> String {
 }
 
 fn default_metrics_scope() -> String {
-    "lifetime".to_string()
+    "aggregate local summaries".to_string()
 }
 
 pub fn command_string(argv: &[String]) -> String {
@@ -640,7 +646,7 @@ fn write_raw_log_header(
 
 fn copy_file_with_trailing_newline(path: &Path, out: &mut fs::File) -> Result<()> {
     let mut input = fs::File::open(path).with_context(|| format!("read {}", path.display()))?;
-    let mut buffer = [0_u8; 8192];
+    let mut buffer = [0_u8; 64 * 1024];
     let mut last_byte = None;
     loop {
         let read = input
@@ -1518,14 +1524,34 @@ pub fn record_run_state_unlocked(
     write_latest_by_command(paths, &latest)?;
 
     let mut metrics = load_metrics(paths);
-    update_metrics_for_sidecar(&mut metrics, sidecar);
+    update_metrics_for_sidecar(&mut metrics, sidecar, MetricRecordKind::SavedArtifact);
     write_metrics(paths, &metrics)
 }
 
-fn update_metrics_for_sidecar(metrics: &mut Metrics, sidecar: &SummarySidecar) {
+pub fn record_metric_only(paths: &Paths, sidecar: &SummarySidecar) -> Result<()> {
+    let mut metrics = load_metrics(paths);
+    update_metrics_for_sidecar(&mut metrics, sidecar, MetricRecordKind::MemoryOnly);
+    write_metrics(paths, &metrics)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetricRecordKind {
+    MemoryOnly,
+    SavedArtifact,
+}
+
+fn update_metrics_for_sidecar(
+    metrics: &mut Metrics,
+    sidecar: &SummarySidecar,
+    record_kind: MetricRecordKind,
+) {
     metrics.metrics_schema_version = METRICS_SCHEMA_VERSION;
     metrics.metrics_scope = default_metrics_scope();
     metrics.command_count += 1;
+    match record_kind {
+        MetricRecordKind::MemoryOnly => metrics.memory_only_count += 1,
+        MetricRecordKind::SavedArtifact => metrics.saved_artifact_count += 1,
+    }
     metrics.raw_line_count += sidecar.raw_total_lines as u64;
     metrics.shown_line_count += sidecar.shown_lines as u64;
     metrics.estimated_saved_lines += sidecar.estimated_saved_lines as u64;
@@ -1555,13 +1581,15 @@ fn update_metrics_for_sidecar(metrics: &mut Metrics, sidecar: &SummarySidecar) {
             .or_default(),
         sidecar,
     );
-    update_command_metrics(
-        metrics
-            .per_command
-            .entry(sidecar.command.clone())
-            .or_default(),
-        sidecar,
-    );
+    if record_kind == MetricRecordKind::SavedArtifact {
+        update_command_metrics(
+            metrics
+                .per_command
+                .entry(sidecar.command.clone())
+                .or_default(),
+            sidecar,
+        );
+    }
 }
 
 fn update_command_metrics(metric: &mut CommandMetrics, sidecar: &SummarySidecar) {
@@ -2304,6 +2332,7 @@ mod tests {
             primary_failure: Some("error: old".into()),
             delta: None,
             top_errors: vec!["error: old".into()],
+            top_warnings: Vec::new(),
             file_hits: Vec::new(),
             tail: vec!["error: old".into()],
             suggested_next_reads: Vec::new(),

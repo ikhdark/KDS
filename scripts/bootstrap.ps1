@@ -76,22 +76,35 @@ if ($Help) {
   @"
 KDS bootstrap installer
 
+KDS turns long build and test output into a short, useful summary.
+It helps you and AI coding tools see what failed, which files matter, and what to check next without dumping hundreds of log lines into the chat.
+
 Copy-paste install:
   irm https://raw.githubusercontent.com/ikhdark/KDS/$Version/scripts/bootstrap.ps1 | iex
 
-Behavior:
+This installs KDS for your Windows user account.
+It builds KDS locally, adds kds.exe to your user PATH, and turns on automatic summaries for supported PowerShell and Codex Desktop build/test commands.
+You need Rust installed first because KDS does not download Rust or a prebuilt app.
+
+What changes?
+  KDS will:
+  - install kds.exe under %LOCALAPPDATA%\CodexKD\bin
+  - add that folder to your user PATH
+  - add a managed PowerShell hook
+  - update Codex Desktop hooks when it finds a Codex home
+  - back up files before changing them
+
+Technical details:
   - prints installed and latest release versions before installing
   - downloads the versioned KDS release source archive
   - verifies the archive SHA-256 checksum from the matching release asset
-  - requires Rust/Cargo to already be available on PATH
-  - never downloads or installs Rust/Cargo
-  - builds KDS with cargo
   - runs scripts/install.ps1 from the downloaded source
 "@ | Write-Host
   exit 0
 }
 
 Write-Host "KDS bootstrap install"
+Write-Host "KDS turns long build and test output into a short, useful summary."
 Write-Host "Version: $Version"
 Write-Host "Source archive: $archiveUrl"
 Write-Host "Checksum: $checksumUrl"

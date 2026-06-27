@@ -172,6 +172,9 @@ function _kds_restore_args {{
   param([object[]]$Rest, [string]$Statement)
   $out = [System.Collections.Generic.List[object]]::new()
   foreach ($arg in $Rest) {{ [void]$out.Add($arg) }}
+  if ($null -eq $Statement -or -not $Statement.Contains('--')) {{
+    return $out.ToArray()
+  }}
   $errors = $null
   $tokens = [System.Management.Automation.PSParser]::Tokenize($Statement, [ref]$errors)
   $seenCommand = $false
@@ -255,31 +258,36 @@ function _kds_gradle_profile {{
 function _kds_profile_should_wrap {{
   param([string]$Name, [object[]]$Rest)
   $command = ([string]$Name).ToLowerInvariant()
+  $first = $null
+  $second = $null
+  if ($Rest.Count -gt 0) {{ $first = ([string]$Rest[0]).ToLowerInvariant() }}
+  if ($Rest.Count -gt 1) {{ $second = ([string]$Rest[1]).ToLowerInvariant() }}
   switch ($command) {{
-    'cargo' {{ return ($Rest.Count -gt 0 -and @('check','test','build','clippy') -contains ([string]$Rest[0]).ToLowerInvariant()) }}
     {{ @('just','make','task') -contains $_ }} {{ return (_kds_script_profile $Rest) }}
     {{ @('npm','pnpm','yarn','bun') -contains $_ }} {{
-      if ($Rest.Count -gt 0 -and ([string]$Rest[0]).ToLowerInvariant() -eq 'test') {{ return $true }}
+      if ($null -ne $first -and $first -eq 'test') {{ return $true }}
       return (_kds_script_profile $Rest)
     }}
     'deno' {{
-      if ($Rest.Count -gt 0 -and @('test','check','lint') -contains ([string]$Rest[0]).ToLowerInvariant()) {{ return $true }}
-      return ($Rest.Count -ge 2 -and ([string]$Rest[0]).ToLowerInvariant() -eq 'task' -and (_kds_safe_task $Rest[1]))
+      if ($null -ne $first -and @('test','check','lint') -contains $first) {{ return $true }}
+      return ($Rest.Count -ge 2 -and $first -eq 'task' -and (_kds_safe_task $Rest[1]))
     }}
     {{ @('tsc','vue-tsc','jest','vitest') -contains $_ }} {{ return -not (_kds_has_blocking_arg $Rest) }}
     'eslint' {{ return $true }}
-    'biome' {{ return ($Rest.Count -gt 0 -and @('check','ci','lint') -contains ([string]$Rest[0]).ToLowerInvariant()) }}
+    'biome' {{ return ($null -ne $first -and @('check','ci','lint') -contains $first) }}
     'prettier' {{ return (_kds_has_flag $Rest @('--check','-c')) }}
-    'playwright' {{ return ($Rest.Count -gt 0 -and ([string]$Rest[0]).ToLowerInvariant() -eq 'test') }}
+    'playwright' {{ return ($null -ne $first -and $first -eq 'test') }}
     'pytest' {{ return $true }}
-    {{ @('python','py') -contains $_ }} {{ return ($Rest.Count -ge 2 -and [string]$Rest[0] -eq '-m' -and (_kds_safe_python_module $Rest[1])) }}
+    {{ @('python','py') -contains $_ }} {{ return ($Rest.Count -ge 2 -and $first -eq '-m' -and (_kds_safe_python_module $Rest[1])) }}
     'ruff' {{
-      return ($Rest.Count -gt 0 -and (([string]$Rest[0]).ToLowerInvariant() -eq 'check' -or (([string]$Rest[0]).ToLowerInvariant() -eq 'format' -and (_kds_has_flag $Rest @('--check')))))
+      if ($null -eq $first) {{ return $false }}
+      if ($first -eq 'check') {{ return $true }}
+      return ($first -eq 'format' -and (_kds_has_flag $Rest @('--check')))
     }}
     {{ @('mypy','pyright') -contains $_ }} {{ return $true }}
-    'uv' {{ return ($Rest.Count -ge 2 -and ([string]$Rest[0]).ToLowerInvariant() -eq 'run' -and (_kds_safe_python_module $Rest[1])) }}
-    'go' {{ return ($Rest.Count -gt 0 -and @('test','build','vet') -contains ([string]$Rest[0]).ToLowerInvariant()) }}
-    'dotnet' {{ return ($Rest.Count -gt 0 -and @('test','build') -contains ([string]$Rest[0]).ToLowerInvariant()) }}
+    'uv' {{ return ($Rest.Count -ge 2 -and $first -eq 'run' -and (_kds_safe_python_module $Rest[1])) }}
+    'go' {{ return ($null -ne $first -and @('test','build','vet') -contains $first) }}
+    'dotnet' {{ return ($null -ne $first -and @('test','build') -contains $first) }}
     {{ @('mvn','mvnw','maven') -contains $_ }} {{
       $goal = _kds_first_non_flag $Rest
       return ($null -ne $goal -and @('test','verify','package','compile') -contains ([string]$goal).ToLowerInvariant())
@@ -287,14 +295,14 @@ function _kds_profile_should_wrap {{
     {{ @('gradle','gradlew') -contains $_ }} {{ return (_kds_gradle_profile $Rest) }}
     'composer' {{ return (_kds_script_profile $Rest) }}
     'phpunit' {{ return $true }}
-    'bundle' {{ return ($Rest.Count -ge 2 -and ([string]$Rest[0]).ToLowerInvariant() -eq 'exec' -and @('rspec','rake','rails') -contains ([string]$Rest[1]).ToLowerInvariant() -and ($Rest.Count -lt 3 -or (_kds_safe_task $Rest[2]) -or ([string]$Rest[1]).ToLowerInvariant() -eq 'rspec')) }}
-    'rails' {{ return ($Rest.Count -gt 0 -and ([string]$Rest[0]).ToLowerInvariant() -eq 'test') }}
+    'bundle' {{ return ($Rest.Count -ge 2 -and $first -eq 'exec' -and @('rspec','rake','rails') -contains $second -and ($Rest.Count -lt 3 -or (_kds_safe_task $Rest[2]) -or $second -eq 'rspec')) }}
+    'rails' {{ return ($null -ne $first -and $first -eq 'test') }}
     'rspec' {{ return $true }}
-    'mix' {{ return ($Rest.Count -gt 0 -and @('test','compile') -contains ([string]$Rest[0]).ToLowerInvariant()) }}
-    'cmake' {{ return ($Rest.Count -gt 0 -and ([string]$Rest[0]).ToLowerInvariant() -eq '--build') }}
+    'mix' {{ return ($null -ne $first -and @('test','compile') -contains $first) }}
+    'cmake' {{ return ($null -ne $first -and $first -eq '--build') }}
     'ninja' {{ return (_kds_script_profile $Rest) }}
     'ctest' {{ return $true }}
-    'mise' {{ return ($Rest.Count -ge 2 -and @('run','r') -contains ([string]$Rest[0]).ToLowerInvariant() -and (_kds_safe_task $Rest[1])) }}
+    'mise' {{ return ($Rest.Count -ge 2 -and @('run','r') -contains $first -and (_kds_safe_task $Rest[1])) }}
     default {{ return $false }}
   }}
 }}
@@ -682,7 +690,7 @@ KDS gain
 KDS -- cargo test
 "native"
 cargo run -- --help
-"wrapped"
+"cargo-test-native"
 cargo test -- --nocapture
 "git-status"
 git status --short
@@ -761,11 +769,8 @@ python scripts/test_publish_local_codex.py
             "stdout:\n{stdout}"
         );
         assert!(
-            stdout.contains(
-                "wrapped\r\nkds:[--]\r\nkds:[cargo]\r\nkds:[test]\r\nkds:[--]\r\nkds:[--nocapture]"
-            ) || stdout.contains(
-                "wrapped\nkds:[--]\nkds:[cargo]\nkds:[test]\nkds:[--]\nkds:[--nocapture]"
-            ),
+            stdout.contains("cargo-test-native\r\n[test]\r\n[--]\r\n[--nocapture]")
+                || stdout.contains("cargo-test-native\n[test]\n[--]\n[--nocapture]"),
             "stdout:\n{stdout}"
         );
         assert!(
@@ -993,9 +998,9 @@ mvn deploy
         }
 
         let dir = tempfile::tempdir().unwrap();
-        let fake_cargo = dir.path().join("cargo.cmd");
+        let fake_npm = dir.path().join("npm.cmd");
         let fake_kds = dir.path().join("kds.cmd");
-        std::fs::write(&fake_cargo, "@echo off\r\necho native-cargo:[%*]\r\n").unwrap();
+        std::fs::write(&fake_npm, "@echo off\r\necho native-npm:[%*]\r\n").unwrap();
         std::fs::write(
             &fake_kds,
             "@echo off\r\n:loop\r\nif \"%~1\"==\"\" goto end\r\necho kds:[%~1]\r\nshift\r\ngoto loop\r\n:end\r\n",
@@ -1011,7 +1016,7 @@ mvn deploy
             r#"
 Set-StrictMode -Version Latest
 "strict-child"
-cargo test
+npm test
 "after-cargo"
 "#,
         )
@@ -1044,8 +1049,8 @@ cargo test
         );
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
-            stdout.contains("strict-child\r\nkds:[--]\r\nkds:[cargo]\r\nkds:[test]\r\nafter-cargo")
-                || stdout.contains("strict-child\nkds:[--]\nkds:[cargo]\nkds:[test]\nafter-cargo"),
+            stdout.contains("strict-child\r\nkds:[--]\r\nkds:[npm]\r\nkds:[test]\r\nafter-cargo")
+                || stdout.contains("strict-child\nkds:[--]\nkds:[npm]\nkds:[test]\nafter-cargo"),
             "stdout:\n{stdout}"
         );
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1091,8 +1096,12 @@ $global:KdsExe = '{}'
 $global:KdsCommand = 'kds.cmd'
 "cargo-run-native"
 cargo run
-"cargo-check-wrapped"
+"cargo-check-native"
 cargo check
+"cargo-build-native"
+cargo build
+"cargo-clippy-native"
+cargo clippy
 "npm-deploy-native"
 npm run deploy
 "npm-lint-wrapped"
@@ -1134,8 +1143,18 @@ npm test
             "stdout:\n{stdout}"
         );
         assert!(
-            stdout.contains("cargo-check-wrapped\r\nkds:[--]\r\nkds:[cargo]\r\nkds:[check]")
-                || stdout.contains("cargo-check-wrapped\nkds:[--]\nkds:[cargo]\nkds:[check]"),
+            stdout.contains("cargo-check-native\r\nnative-cargo:[check]")
+                || stdout.contains("cargo-check-native\nnative-cargo:[check]"),
+            "stdout:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("cargo-build-native\r\nnative-cargo:[build]")
+                || stdout.contains("cargo-build-native\nnative-cargo:[build]"),
+            "stdout:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("cargo-clippy-native\r\nnative-cargo:[clippy]")
+                || stdout.contains("cargo-clippy-native\nnative-cargo:[clippy]"),
             "stdout:\n{stdout}"
         );
         assert!(

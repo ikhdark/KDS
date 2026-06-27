@@ -14,8 +14,10 @@
 - Normal KDS runtime commands must not call the network. Update checks are
   explicit: installer-time release metadata checks and `kds update check`.
 - V1 is memory-only by default: wrapped commands and imported logs must not
-  write raw logs, temp stdout/stderr files, sidecars, run indexes, or metrics
-  unless artifact saving is explicitly enabled.
+  write raw logs, temp stdout/stderr files, sidecars, run indexes, or
+  repeat-failure tracking state unless artifact saving is explicitly enabled.
+  Default runs may write aggregate-only `kds gain` metrics without run IDs,
+  local paths, sidecars, or command strings.
 - Saved artifact mode is opt-in through `--save-artifacts` or
   `KDS_SAVE_ARTIFACTS=1`. In saved artifact mode, `KDS_MAX_RAW_BYTES` may
   change the persisted raw-byte cap, and `KDS_UNCAPPED_RAW_LOGS=1` is the
@@ -25,8 +27,9 @@
 - First response must stay compact.
 - Success path compression is required for exit code `0`.
 - Sidecars and `runs.jsonl` are saved-artifact product surfaces.
-- `kds gain` metrics are lifetime counters, while cleanup reconciliation keeps
-  current lookup state aligned with retained sidecars.
+- `kds gain` metrics are lifetime counters over aggregate local summaries,
+  while cleanup reconciliation keeps current lookup state aligned with retained
+  sidecars.
 - Repeated-failure wording is advisory: "same failure signal," never "same
   root cause."
 - Digest/delta state must never skip command execution.

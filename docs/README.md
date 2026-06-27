@@ -24,6 +24,8 @@ Scope: `docs/`.
 - Preserve V1 constraints: no telemetry, no stored raw-log display command,
   runtime network only for explicit update checks or installer release checks,
   and PowerShell-only automatic activation.
+- Document Cargo validation commands as native automatic-hook passthrough, not
+  as built-in auto-wrapped profiles.
 - State that KDS does not download or install Rust/Cargo; source-based install
   requires Cargo to already be available on PATH.
 - Use the wording "same failure signal" for repeated-failure behavior.

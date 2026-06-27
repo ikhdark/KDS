@@ -1,10 +1,11 @@
 use regex::Regex;
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::sync::OnceLock;
 
 use crate::storage::{ErrorWindow, SummarySidecar};
 
-const COMPACT_RUN_HEADER: &str = "KDS";
+const COMPACT_RUN_HEADER: &str = "KDS summary";
 
 #[derive(Debug, Clone)]
 pub struct ExtractedSummary {
@@ -12,6 +13,7 @@ pub struct ExtractedSummary {
     pub warning_count: usize,
     pub primary_failure: Option<String>,
     pub top_errors: Vec<String>,
+    pub top_warnings: Vec<String>,
     pub file_hits: Vec<String>,
     pub tail: Vec<String>,
     pub suggested_next_reads: Vec<String>,
@@ -53,6 +55,7 @@ pub struct SummaryBuilder {
     warning_count: usize,
     error_count: usize,
     top_errors: Vec<String>,
+    top_warnings: Vec<String>,
     file_hits: Vec<String>,
     tail: VecDeque<String>,
     before: VecDeque<String>,
@@ -69,9 +72,9 @@ impl SummaryBuilder {
     }
 
     pub fn push_stream_line(&mut self, stream: &str, raw_line: &str) {
-        let line = redact_sensitive_text(&strip_ansi(raw_line))
-            .trim_end()
-            .to_string();
+        let stripped = strip_ansi(raw_line);
+        let redacted = redact_sensitive_text_cow(stripped.as_ref());
+        let line = redacted.trim_end().to_string();
         self.line_number += 1;
         let pending = std::mem::take(&mut self.pending_error_windows);
         for (index, remaining) in pending {
@@ -87,14 +90,23 @@ impl SummaryBuilder {
         if let Some(context) = file_context_line(&line) {
             self.current_file_context = Some(context);
         }
-        let adapter = adapt_failure_line(&line, self.current_file_context.as_deref());
-        let lower = line.to_ascii_lowercase();
-        let generic_warning = lower.contains("warning:")
-            || lower.starts_with("warn ")
-            || lower.starts_with("npm warn ")
-            || lower.contains(" npm warn ");
+        let adapter = if may_contain_adapter_signal(&line, self.current_file_context.as_deref()) {
+            adapt_failure_line(&line, self.current_file_context.as_deref())
+        } else {
+            AdapterSignals::default()
+        };
+        let trimmed_start = line.trim_start();
+        let generic_warning = contains_ascii_case_insensitive(&line, "warning:")
+            || starts_ascii_case_insensitive(trimmed_start, "warn ")
+            || starts_ascii_case_insensitive(trimmed_start, "npm warn ")
+            || contains_ascii_case_insensitive(&line, " npm warn ");
         if generic_warning || adapter.is_warning {
             self.warning_count += 1;
+            push_unique_cap(
+                &mut self.top_warnings,
+                adapter.primary.clone().unwrap_or_else(|| line.clone()),
+                8,
+            );
         }
         let generic_error = is_error_line(&line);
         let is_error = generic_error || adapter.is_error;
@@ -119,8 +131,10 @@ impl SummaryBuilder {
             for hit in adapter.file_hits {
                 push_unique_cap(&mut self.file_hits, hit, 10);
             }
-            for hit in extract_file_hits(&line, 10) {
-                push_unique_cap(&mut self.file_hits, hit, 10);
+            if self.file_hits.len() < 10 && may_contain_file_hit(&line) {
+                for hit in extract_file_hits(&line, 10) {
+                    push_unique_cap(&mut self.file_hits, hit, 10);
+                }
             }
             self.tail.push_back(line.clone());
             if self.tail.len() > 40 {
@@ -138,6 +152,9 @@ impl SummaryBuilder {
         self.error_count += other.error_count;
         for item in other.top_errors {
             push_unique_cap(&mut self.top_errors, item, 8);
+        }
+        for item in other.top_warnings {
+            push_unique_cap(&mut self.top_warnings, item, 8);
         }
         for item in other.file_hits {
             push_unique_cap(&mut self.file_hits, item, 10);
@@ -192,6 +209,7 @@ impl SummaryBuilder {
             warning_count: self.warning_count,
             primary_failure,
             top_errors: self.top_errors,
+            top_warnings: self.top_warnings,
             file_hits: self.file_hits,
             tail: self.tail.into_iter().collect(),
             suggested_next_reads,
@@ -285,17 +303,42 @@ pub fn merge_stream_summaries(
     }
 }
 
-fn strip_ansi(text: &str) -> String {
+fn strip_ansi(text: &str) -> Cow<'_, str> {
+    if !text.as_bytes().contains(&0x1b) {
+        return Cow::Borrowed(text);
+    }
     static ANSI_RE: OnceLock<Regex> = OnceLock::new();
     let re = ANSI_RE.get_or_init(|| Regex::new(r"\x1b\[[0-?]*[ -/]*[@-~]").unwrap());
-    re.replace_all(text, "").to_string()
+    re.replace_all(text, "")
+}
+
+fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
+    let needle = needle.as_bytes();
+    if needle.is_empty() {
+        return true;
+    }
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle))
+}
+
+fn starts_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
+    let haystack = haystack.as_bytes();
+    let needle = needle.as_bytes();
+    haystack.len() >= needle.len() && haystack[..needle.len()].eq_ignore_ascii_case(needle)
 }
 
 pub fn redact_sensitive_text(text: &str) -> String {
-    let mut redacted = known_secret_re()
-        .replace_all(text, "[redacted-secret]")
-        .to_string();
-    if !needs_redaction_scan(&redacted) {
+    redact_sensitive_text_cow(text).into_owned()
+}
+
+fn redact_sensitive_text_cow(text: &str) -> Cow<'_, str> {
+    if !may_contain_sensitive_text(text) {
+        return Cow::Borrowed(text);
+    }
+    let mut redacted = known_secret_re().replace_all(text, "[redacted-secret]");
+    if !may_contain_sensitive_text(redacted.as_ref()) {
         return redacted;
     }
     for (pattern, replacement) in [
@@ -306,39 +349,47 @@ pub fn redact_sensitive_text(text: &str) -> String {
         (keyed_secret_re(), "${1}${2}[redacted]${3}"),
         (bearer_re(), "${1}[redacted]"),
     ] {
-        redacted = pattern.replace_all(&redacted, replacement).to_string();
+        redacted = Cow::Owned(
+            pattern
+                .replace_all(redacted.as_ref(), replacement)
+                .into_owned(),
+        );
     }
     redacted
 }
 
-fn needs_redaction_scan(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    lower.contains("token")
-        || lower.contains("secret")
-        || lower.contains("password")
-        || lower.contains("passwd")
-        || lower.contains("pwd")
-        || lower.contains("key")
-        || lower.contains("credential")
-        || lower.contains("authorization")
-        || lower.contains("bearer")
-        || lower.contains("api")
-        || lower.contains("://")
-        || lower.contains("ghp_")
-        || lower.contains("github_pat_")
-        || lower.contains("glpat-")
-        || lower.contains("sk-")
-        || lower.contains("rk_live")
-        || lower.contains("rk_test")
-        || lower.contains("sk_live")
-        || lower.contains("sk_test")
-        || lower.contains("akia")
-        || lower.contains("asia")
-        || lower.contains("aiza")
-        || lower.contains("xox")
-        || lower.contains("npm_")
-        || lower.contains("eyj")
+fn may_contain_sensitive_text(text: &str) -> bool {
+    text.contains("://")
         || looks_like_dot_secret(text)
+        || [
+            "token",
+            "secret",
+            "password",
+            "passwd",
+            "pwd",
+            "key",
+            "credential",
+            "authorization",
+            "bearer",
+            "api",
+            "ghp_",
+            "github_pat_",
+            "glpat-",
+            "sk-",
+            "rk_live",
+            "rk_test",
+            "sk_live",
+            "sk_test",
+            "akia",
+            "asia",
+            "aiza",
+            "xox",
+            "npm_",
+            "eyj",
+            "sg.",
+        ]
+        .iter()
+        .any(|needle| contains_ascii_case_insensitive(text, needle))
 }
 
 fn looks_like_dot_secret(text: &str) -> bool {
@@ -472,14 +523,35 @@ pub fn format_compact_with_paths(sidecar: &SummarySidecar, show_paths: bool) -> 
 fn format_compact_unbounded(sidecar: &SummarySidecar, show_paths: bool) -> String {
     if sidecar.exit_code == 0 && sidecar.warning_count == 0 {
         let mut out = format!(
-            "{COMPACT_RUN_HEADER}\nRun ID: {}\nExit code: 0\nElapsed: {}\n{}\nEstimated output reduction: {} lines ({:.1}%)\nSummary: success\nNext action: {}\nWarnings: 0\n",
-            sidecar.run_id,
+            "{COMPACT_RUN_HEADER}\n{}\nCommand: {}\nTime: {}\n{}\nTry next: {}\nWarnings: 0\n",
+            result_line(sidecar),
+            display_command(sidecar, show_paths),
             sidecar.elapsed,
-            log_line(sidecar, show_paths),
-            sidecar.estimated_saved_lines,
-            sidecar.estimated_output_reduction_percent,
-            next_action(sidecar)
+            saved_logs_line(sidecar, show_paths),
+            next_action(sidecar),
         );
+        append_runtime_warnings(&mut out, sidecar);
+        return out;
+    }
+
+    if sidecar.exit_code == 0 {
+        let caps = display_caps(sidecar);
+        let mut out = String::new();
+        out.push_str(COMPACT_RUN_HEADER);
+        out.push('\n');
+        out.push_str(&format!("Run ID: {}\n", sidecar.run_id));
+        out.push_str(&format!("{}\n", result_line(sidecar)));
+        out.push_str(&format!("Time: {}\n", sidecar.elapsed));
+        out.push_str(&format!("{}\n", saved_logs_line(sidecar, show_paths)));
+        out.push_str(&format!("Warnings: {}\n", sidecar.warning_count));
+        out.push_str("Top warnings:\n");
+        write_list(
+            &mut out,
+            &display_list(&sidecar.top_warnings, sidecar, show_paths),
+            caps.top_errors,
+        );
+        out.push_str(&details_line(sidecar));
+        out.push_str(&format!("{}\n", estimated_token_savings_line(sidecar)));
         append_runtime_warnings(&mut out, sidecar);
         return out;
     }
@@ -489,83 +561,71 @@ fn format_compact_unbounded(sidecar: &SummarySidecar, show_paths: bool) -> Strin
         out.push_str(COMPACT_RUN_HEADER);
         out.push('\n');
         out.push_str(&format!("Run ID: {}\n", sidecar.run_id));
-        out.push_str(&format!("Exit code: {}\n", sidecar.exit_code));
-        out.push_str(&format!("Elapsed: {}\n", sidecar.elapsed));
-        out.push_str(&format!("Repeat: {}\n", sidecar.repeat_status.message));
+        out.push_str(&format!("{}\n", result_line(sidecar)));
+        out.push_str(&format!("Time: {}\n", sidecar.elapsed));
+        out.push_str(&format!("{}\n", seen_before_line(sidecar)));
         if let Some(delta) = &sidecar.delta {
             out.push_str(&format!("Changed since previous run: {delta}\n"));
         }
-        out.push_str(&format!(
-            "Primary failure: {}\n",
-            sidecar
+        out.push_str("Main problem:\n");
+        write_list(
+            &mut out,
+            &sidecar
                 .primary_failure
                 .as_deref()
-                .map(|text| display_text(text, sidecar, show_paths))
-                .unwrap_or_else(|| "none".to_string())
-        ));
-        out.push_str(&format!("Next action: {}\n", next_action(sidecar)));
-        out.push_str("Suggested next read:\n");
-        write_list(&mut out, &suggested_next_commands(sidecar), 3);
-        out.push_str(&format!(
-            "Estimated savings: {} lines ({:.1}%)\n",
-            sidecar.estimated_saved_lines, sidecar.estimated_output_reduction_percent
-        ));
-        out.push_str(&format!("{}\n", log_line(sidecar, show_paths)));
+                .map(|text| vec![display_text(text, sidecar, show_paths)])
+                .unwrap_or_default(),
+            1,
+        );
+        out.push_str(&format!("Try next: {}\n", next_action(sidecar)));
+        write_action_suggestion(&mut out, sidecar, show_paths);
+        out.push_str(&details_line(sidecar));
+        out.push_str(&format!("{}\n", saved_logs_line(sidecar, show_paths)));
         append_runtime_warnings(&mut out, sidecar);
         return out;
     }
 
-    let caps = display_caps();
+    let caps = display_caps(sidecar);
     let mut out = String::new();
     out.push_str(COMPACT_RUN_HEADER);
     out.push('\n');
     out.push_str(&format!("Run ID: {}\n", sidecar.run_id));
     out.push_str(&format!(
         "Command: {}\n",
-        display_text(&sidecar.command, sidecar, show_paths)
+        display_command(sidecar, show_paths)
     ));
     if show_paths {
         out.push_str(&format!("CWD: {}\n", sidecar.cwd));
     }
-    out.push_str(&format!("Exit code: {}\n", sidecar.exit_code));
-    out.push_str(&format!("Elapsed: {}\n", sidecar.elapsed));
-    out.push_str(&format!("{}\n", log_line(sidecar, show_paths)));
-    out.push_str(&format!("Digest: {}\n", sidecar.digest));
-    out.push_str(&format!("Repeat: {}\n", sidecar.repeat_status.message));
-    out.push_str(&format!(
-        "Estimated savings: {} lines ({:.1}%)\n",
-        sidecar.estimated_saved_lines, sidecar.estimated_output_reduction_percent
-    ));
-    if sidecar.exit_code == 0 {
-        out.push_str("Summary: success with warnings\n");
-    } else {
-        out.push_str("Summary: failed; compact evidence follows\n");
-    }
+    out.push_str(&format!("{}\n", result_line(sidecar)));
+    out.push_str(&format!("Time: {}\n", sidecar.elapsed));
+    out.push_str(&format!("{}\n", saved_logs_line(sidecar, show_paths)));
+    out.push_str(&format!("{}\n", seen_before_line(sidecar)));
     if let Some(delta) = &sidecar.delta {
         out.push_str(&format!("Changed since previous run: {delta}\n"));
     }
-    out.push_str(&format!("Next action: {}\n", next_action(sidecar)));
-    out.push_str("Top errors:\n");
+    out.push_str("Main problem:\n");
     write_list(
         &mut out,
         &display_list(&sidecar.top_errors, sidecar, show_paths),
         caps.top_errors,
     );
-    out.push_str("File hits:\n");
+    out.push_str("Files mentioned:\n");
     write_list(
         &mut out,
         &display_list(&sidecar.file_hits, sidecar, show_paths),
         caps.file_hits,
     );
     out.push_str(&format!("Warnings: {}\n", sidecar.warning_count));
-    out.push_str("Final tail:\n");
+    out.push_str("Last output shown:\n");
     write_list(
         &mut out,
         &display_list(&sidecar.tail, sidecar, show_paths),
         caps.tail,
     );
-    out.push_str("Suggested next read:\n");
-    write_list(&mut out, &suggested_next_commands(sidecar), caps.suggested);
+    out.push_str(&format!("Try next: {}\n", next_action(sidecar)));
+    write_action_suggestion(&mut out, sidecar, show_paths);
+    out.push_str(&details_line(sidecar));
     append_runtime_warnings(&mut out, sidecar);
     out
 }
@@ -601,6 +661,7 @@ pub fn format_evidence_with_paths(sidecar: &SummarySidecar, show_paths: bool) ->
         out.push_str(&format!("Changed since previous run: {delta}\n"));
     }
     out.push_str(&format!("Next action: {}\n", next_action(sidecar)));
+    write_action_suggestion(&mut out, sidecar, show_paths);
     out.push_str("Top errors:\n");
     write_list(
         &mut out,
@@ -766,6 +827,25 @@ fn adapt_failure_line(line: &str, file_context: Option<&str>) -> AdapterSignals 
     AdapterSignals::default()
 }
 
+fn may_contain_adapter_signal(line: &str, file_context: Option<&str>) -> bool {
+    let bytes = line.as_bytes();
+    let trimmed = line.trim_start();
+    (file_context.is_some()
+        && bytes.contains(&b':')
+        && (contains_ascii_case_insensitive(line, "error")
+            || contains_ascii_case_insensitive(line, "warning")))
+        || (bytes.contains(&b'.') && bytes.contains(&b':'))
+        || trimmed.starts_with('●')
+        || trimmed.starts_with('✕')
+        || trimmed.starts_with('×')
+        || trimmed.starts_with(">")
+        || trimmed.starts_with("--- FAIL:")
+        || starts_ascii_case_insensitive(trimmed, "failed ")
+        || starts_ascii_case_insensitive(trimmed, "[error]")
+        || starts_ascii_case_insensitive(trimmed, "failure: build failed")
+        || (trimmed.chars().next().is_some_and(|ch| ch.is_ascii_digit()) && trimmed.contains(')'))
+}
+
 fn file_context_line(line: &str) -> Option<String> {
     let trimmed = line.trim();
     if trimmed.is_empty() || trimmed.len() > 300 || trimmed.contains("://") {
@@ -778,32 +858,32 @@ fn file_context_line(line: &str) -> Option<String> {
 }
 
 fn is_error_line(line: &str) -> bool {
-    let lower = line.to_ascii_lowercase();
-    lower.contains("error[")
-        || lower.contains("[error]")
-        || lower.contains("error:")
-        || lower.contains(": error ")
-        || lower.contains(" error ts")
-        || lower.starts_with("error ")
-        || lower.starts_with("fail ")
-        || lower.starts_with("--- fail:")
-        || lower.starts_with("failure:")
-        || lower.contains("err!")
-        || lower.contains("error: ")
-        || lower.contains("panicked at")
-        || lower.contains("assertionerror")
-        || lower.contains("typeerror")
-        || lower.contains("referenceerror")
-        || lower.contains("syntaxerror")
-        || lower.contains("could not compile")
-        || lower.contains("code style issues found")
-        || lower.contains("failed to")
-        || lower.starts_with("failed ")
-        || lower.contains(" build failed")
-        || lower.starts_with("traceback ")
-        || lower.starts_with("e   ")
-        || lower.contains("exception")
-        || lower.contains("fatal:")
+    let trimmed = line.trim_start();
+    contains_ascii_case_insensitive(line, "error[")
+        || contains_ascii_case_insensitive(line, "[error]")
+        || contains_ascii_case_insensitive(line, "error:")
+        || contains_ascii_case_insensitive(line, ": error ")
+        || contains_ascii_case_insensitive(line, " error ts")
+        || starts_ascii_case_insensitive(trimmed, "error ")
+        || starts_ascii_case_insensitive(trimmed, "fail ")
+        || starts_ascii_case_insensitive(trimmed, "--- fail:")
+        || starts_ascii_case_insensitive(trimmed, "failure:")
+        || contains_ascii_case_insensitive(line, "err!")
+        || contains_ascii_case_insensitive(line, "error: ")
+        || contains_ascii_case_insensitive(line, "panicked at")
+        || contains_ascii_case_insensitive(line, "assertionerror")
+        || contains_ascii_case_insensitive(line, "typeerror")
+        || contains_ascii_case_insensitive(line, "referenceerror")
+        || contains_ascii_case_insensitive(line, "syntaxerror")
+        || contains_ascii_case_insensitive(line, "could not compile")
+        || contains_ascii_case_insensitive(line, "code style issues found")
+        || contains_ascii_case_insensitive(line, "failed to")
+        || starts_ascii_case_insensitive(trimmed, "failed ")
+        || contains_ascii_case_insensitive(line, " build failed")
+        || starts_ascii_case_insensitive(trimmed, "traceback ")
+        || starts_ascii_case_insensitive(trimmed, "e   ")
+        || contains_ascii_case_insensitive(line, "exception")
+        || contains_ascii_case_insensitive(line, "fatal:")
 }
 
 fn eslint_location_re() -> &'static Regex {
@@ -909,6 +989,18 @@ fn extract_file_hits(text: &str, cap: usize) -> Vec<String> {
     hits
 }
 
+fn may_contain_file_hit(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let trimmed = text.trim_start();
+    bytes.contains(&b'.')
+        && (bytes.contains(&b':')
+            || bytes.contains(&b'(')
+            || bytes.contains(&b'/')
+            || bytes.contains(&b'\\')
+            || trimmed.starts_with("FAIL ")
+            || trimmed.starts_with("FAILED "))
+}
+
 fn file_hit_re() -> &'static Regex {
     static FILE_HIT_RE: OnceLock<Regex> = OnceLock::new();
     FILE_HIT_RE.get_or_init(|| {
@@ -947,7 +1039,7 @@ fn fail_file_re() -> &'static Regex {
 
 fn log_line(sidecar: &SummarySidecar, show_paths: bool) -> String {
     if sidecar.log_path.is_empty() {
-        return "Artifacts: not saved (memory-only)".to_string();
+        return "Saved logs: no".to_string();
     }
     if show_paths {
         format!("Log: {}", sidecar.log_path)
@@ -956,18 +1048,50 @@ fn log_line(sidecar: &SummarySidecar, show_paths: bool) -> String {
     }
 }
 
+fn saved_logs_line(sidecar: &SummarySidecar, show_paths: bool) -> String {
+    if sidecar.log_path.is_empty() {
+        return "Saved logs: no".to_string();
+    }
+    if show_paths {
+        format!("Saved logs: yes ({})", sidecar.log_path)
+    } else {
+        format!(
+            "Saved logs: yes; inspect with `kds logs {}`",
+            sidecar.run_id
+        )
+    }
+}
+
+fn result_line(sidecar: &SummarySidecar) -> String {
+    if sidecar.exit_code == 0 && sidecar.warning_count == 0 {
+        "Result: passed".to_string()
+    } else if sidecar.exit_code == 0 {
+        "Result: passed with warnings".to_string()
+    } else {
+        format!("Result: failed (exit code {})", sidecar.exit_code)
+    }
+}
+
+fn seen_before_line(sidecar: &SummarySidecar) -> String {
+    if sidecar.repeat_status.is_repeat {
+        format!("Seen before: yes ({})", sidecar.repeat_status.message)
+    } else {
+        "Seen before: no".to_string()
+    }
+}
+
 fn next_action(sidecar: &SummarySidecar) -> &'static str {
     if sidecar.spawn_error.is_some() {
-        return "spawn failure";
+        return "check that the command exists and can be started";
     }
     if sidecar.exit_code == 0 && sidecar.warning_count == 0 {
-        return "success";
+        return "nothing, the command passed";
     }
     if sidecar.exit_code == 0 {
-        return "success with warnings";
+        return "review the warnings";
     }
     if sidecar.repeat_status.is_repeat {
-        return "repeat failure";
+        return "compare with the previous matching failure";
     }
 
     let evidence = sidecar
@@ -979,7 +1103,7 @@ fn next_action(sidecar: &SummarySidecar) -> &'static str {
         .collect::<Vec<_>>()
         .join("\n");
     if evidence.trim().is_empty() {
-        return "more output context needed";
+        return "inspect more details";
     }
     if evidence.contains("command not found")
         || evidence.contains("no such file or directory")
@@ -990,7 +1114,7 @@ fn next_action(sidecar: &SummarySidecar) -> &'static str {
         || evidence.contains("unresolved import")
         || evidence.contains("failed to resolve")
     {
-        return "likely missing dependency";
+        return "check for a missing dependency or module";
     }
     if evidence.contains("could not compile")
         || evidence.contains("error[")
@@ -998,7 +1122,7 @@ fn next_action(sidecar: &SummarySidecar) -> &'static str {
         || evidence.contains("failed to compile")
         || evidence.contains("compilation failed")
     {
-        return "likely compile error";
+        return "fix the first compile error";
     }
     if evidence.contains("assertionerror")
         || evidence.contains("assertion failed")
@@ -1007,9 +1131,9 @@ fn next_action(sidecar: &SummarySidecar) -> &'static str {
         || evidence.contains("failures:")
         || evidence.contains(" expected ")
     {
-        return "likely test assertion failure";
+        return "start with the failing test assertion";
     }
-    "new failure"
+    "start with the main problem above"
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1017,24 +1141,58 @@ struct DisplayCaps {
     top_errors: usize,
     file_hits: usize,
     tail: usize,
-    suggested: usize,
     lines: usize,
     chars: usize,
 }
 
-fn display_caps() -> DisplayCaps {
-    DisplayCaps {
-        top_errors: 3,
-        file_hits: 5,
-        tail: 12,
-        suggested: 3,
-        lines: 30,
-        chars: 4000,
+fn display_caps(sidecar: &SummarySidecar) -> DisplayCaps {
+    match budget_mode(sidecar) {
+        BudgetMode::Tiny => DisplayCaps {
+            top_errors: 2,
+            file_hits: 3,
+            tail: 4,
+            lines: 16,
+            chars: 1600,
+        },
+        BudgetMode::Normal => DisplayCaps {
+            top_errors: 3,
+            file_hits: 5,
+            tail: 12,
+            lines: 30,
+            chars: 4000,
+        },
+        BudgetMode::Verbose => DisplayCaps {
+            top_errors: 6,
+            file_hits: 10,
+            tail: 24,
+            lines: 60,
+            chars: 8000,
+        },
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BudgetMode {
+    Tiny,
+    Normal,
+    Verbose,
+}
+
+fn budget_mode(sidecar: &SummarySidecar) -> BudgetMode {
+    match sidecar.summary_budget.as_str() {
+        "tiny" => BudgetMode::Tiny,
+        "normal" => BudgetMode::Normal,
+        "verbose" => BudgetMode::Verbose,
+        _ if sidecar.exit_code == 0 => BudgetMode::Tiny,
+        _ if !sidecar.top_errors.is_empty() || !sidecar.error_windows.is_empty() => {
+            BudgetMode::Tiny
+        }
+        _ => BudgetMode::Normal,
     }
 }
 
 fn apply_output_budget(text: String, sidecar: &SummarySidecar) -> String {
-    let caps = display_caps();
+    let caps = display_caps(sidecar);
     let mut out = String::new();
     let mut used_chars = 0;
     let mut truncated = false;
@@ -1084,6 +1242,90 @@ fn suggested_next_commands(sidecar: &SummarySidecar) -> Vec<String> {
     commands
 }
 
+#[derive(Debug, Clone)]
+struct ActionSuggestion {
+    command: Option<String>,
+    open_first: Option<String>,
+    confidence: &'static str,
+}
+
+fn write_action_suggestion(out: &mut String, sidecar: &SummarySidecar, show_paths: bool) {
+    let Some(suggestion) = action_suggestion(sidecar, show_paths) else {
+        return;
+    };
+    if let Some(command) = suggestion.command {
+        out.push_str(&format!("Suggested command: {command}\n"));
+    }
+    if let Some(open_first) = suggestion.open_first {
+        out.push_str(&format!("Open first: {open_first}\n"));
+    }
+    out.push_str(&format!("Confidence: {}\n", suggestion.confidence));
+}
+
+fn action_suggestion(sidecar: &SummarySidecar, show_paths: bool) -> Option<ActionSuggestion> {
+    if sidecar.exit_code == 0 || sidecar.spawn_error.is_some() {
+        return None;
+    }
+    let command = sidecar
+        .test_or_package_hint
+        .as_deref()
+        .and_then(suggested_command_for_hint);
+    let open_first = sidecar
+        .file_hits
+        .first()
+        .map(|hit| display_text(hit, sidecar, show_paths));
+    if command.is_none() && open_first.is_none() {
+        return None;
+    }
+    let confidence = if command.is_some() && open_first.is_some() {
+        "high"
+    } else {
+        "medium"
+    };
+    Some(ActionSuggestion {
+        command,
+        open_first,
+        confidence,
+    })
+}
+
+fn suggested_command_for_hint(hint: &str) -> Option<String> {
+    if let Some(name) = hint.strip_prefix("rust test ") {
+        return Some(command_line("cargo", &["test", name]));
+    }
+    if let Some(package) = hint.strip_prefix("cargo package ") {
+        return Some(command_line("cargo", &["check", "-p", package]));
+    }
+    if let Some(node_id) = hint.strip_prefix("pytest ") {
+        return Some(command_line("pytest", &[node_id]));
+    }
+    if let Some(name) = hint.strip_prefix("go test ") {
+        return Some(command_line("go", &["test", "-run", name]));
+    }
+    if let Some(name) = hint.strip_prefix("dotnet test ") {
+        let filter = format!("FullyQualifiedName~{name}");
+        return Some(command_line("dotnet", &["test", "--filter", &filter]));
+    }
+    None
+}
+
+fn command_line(program: &str, args: &[&str]) -> String {
+    let argv = std::iter::once(program.to_string())
+        .chain(args.iter().map(|arg| (*arg).to_string()))
+        .collect::<Vec<_>>();
+    storage_command_string(&argv)
+}
+
+fn details_line(sidecar: &SummarySidecar) -> String {
+    if sidecar.log_path.is_empty() {
+        "Details: unavailable because logs were not saved\n".to_string()
+    } else if sidecar.top_errors.is_empty() && sidecar.error_windows.is_empty() {
+        format!("Details: kds logs {} --tail\n", sidecar.run_id)
+    } else {
+        format!("Details: kds logs {} --error-window\n", sidecar.run_id)
+    }
+}
+
 fn display_list(items: &[String], sidecar: &SummarySidecar, show_paths: bool) -> Vec<String> {
     items
         .iter()
@@ -1101,6 +1343,53 @@ fn display_text(text: &str, sidecar: &SummarySidecar, show_paths: bool) -> Strin
         out = replace_path_prefix(&out, &home, "~");
     }
     out
+}
+
+fn display_command(sidecar: &SummarySidecar, show_paths: bool) -> String {
+    if show_paths || sidecar.argv.len() <= 4 {
+        return display_text(&sidecar.command, sidecar, show_paths);
+    }
+    let visible = storage_command_string(&sidecar.argv[..2]);
+    let hidden = sidecar.argv.len().saturating_sub(2);
+    format!(
+        "{} ... [{} arg{} hidden; use --show-paths]",
+        display_text(&visible, sidecar, show_paths),
+        hidden,
+        if hidden == 1 { "" } else { "s" }
+    )
+}
+
+fn storage_command_string(argv: &[String]) -> String {
+    argv.iter()
+        .map(|arg| {
+            if arg
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || "-_./:@".contains(ch))
+            {
+                arg.clone()
+            } else {
+                format!("\"{}\"", arg.replace('"', "\\\""))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn estimated_token_savings_line(sidecar: &SummarySidecar) -> String {
+    format!(
+        "Estimated token savings: {} of {} raw ({:.1}%)",
+        sidecar.approx_saved_tokens,
+        sidecar.approx_raw_tokens,
+        storage_percent(sidecar.approx_saved_tokens, sidecar.approx_raw_tokens)
+    )
+}
+
+fn storage_percent(numerator: usize, denominator: usize) -> f64 {
+    if denominator == 0 {
+        0.0
+    } else {
+        (numerator as f64 / denominator as f64) * 100.0
+    }
 }
 
 fn replace_path_prefix(text: &str, prefix: &str, replacement: &str) -> String {
@@ -1246,6 +1535,7 @@ mod tests {
             primary_failure: Some("error: C:\\Users\\tester\\repo\\src\\main.rs:1".into()),
             delta: None,
             top_errors: vec!["error: C:\\Users\\tester\\repo\\src\\main.rs:1".into()],
+            top_warnings: Vec::new(),
             file_hits: vec!["C:\\Users\\tester\\repo\\src\\main.rs:1".into()],
             tail: vec!["failed at C:\\Users\\tester\\repo\\src\\main.rs:1".into()],
             suggested_next_reads: vec!["C:\\Users\\tester\\repo\\src\\main.rs:1".into()],
@@ -1293,6 +1583,10 @@ mod tests {
             .file_hits
             .iter()
             .any(|hit| hit == "tests/test_api.py::test_create_user"));
+        assert_eq!(
+            summary.test_or_package_hint.as_deref(),
+            Some("pytest tests/test_api.py::test_create_user")
+        );
     }
 
     #[test]
@@ -1478,7 +1772,7 @@ discord=aaaaaaaaaaaaaaaaaaaaaaaa.bbbbbb.cccccccccccccccccccccccccccccc
             !hidden.contains("C:\\Users\\tester\\kds\\run.log"),
             "hidden:\n{hidden}"
         );
-        assert!(hidden.contains("Log: use `kds logs run-123 --show-paths`"));
+        assert!(hidden.contains("Saved logs: yes; inspect with `kds logs run-123`"));
         assert!(
             hidden.contains("<cwd>\\src\\main.rs:1"),
             "hidden:\n{hidden}"
@@ -1490,8 +1784,45 @@ discord=aaaaaaaaaaaaaaaaaaaaaaaa.bbbbbb.cccccccccccccccccccccccccccccc
             "shown:\n{shown}"
         );
         assert!(
-            shown.contains("Log: C:\\Users\\tester\\kds\\run.log"),
+            shown.contains("Saved logs: yes (C:\\Users\\tester\\kds\\run.log)"),
             "shown:\n{shown}"
+        );
+    }
+
+    #[test]
+    fn compact_output_surfaces_focused_next_action() {
+        let mut sidecar = sidecar_for_display();
+        sidecar.test_or_package_hint = Some("rust test parser::handles_empty_input".into());
+
+        let rendered = format_compact_with_paths(&sidecar, false);
+
+        assert!(
+            rendered.contains("Suggested command: cargo test parser::handles_empty_input"),
+            "rendered:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("Open first: <cwd>\\src\\main.rs:1"),
+            "rendered:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("Confidence: high"),
+            "rendered:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn focused_next_commands_are_built_from_existing_hints() {
+        assert_eq!(
+            suggested_command_for_hint("pytest tests/test_api.py::test_create_user").as_deref(),
+            Some("pytest tests/test_api.py::test_create_user")
+        );
+        assert_eq!(
+            suggested_command_for_hint("cargo package kds-core").as_deref(),
+            Some("cargo check -p kds-core")
+        );
+        assert_eq!(
+            suggested_command_for_hint("dotnet test MyApp.Tests.LoginTest").as_deref(),
+            Some("dotnet test --filter \"FullyQualifiedName~MyApp.Tests.LoginTest\"")
         );
     }
 }

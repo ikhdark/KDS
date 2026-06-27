@@ -57,17 +57,20 @@ line count, Desktop hook install/trust status, and hooks.json parse health
 without creating logs or printing raw stdout/stderr bodies.
 
 To validate runtime resilience, use temp `KDS_HOME` runs to verify default runs
-do not create `logs`, `state`, raw logs, temp stdout/stderr files, sidecars,
-indexes, or metrics. For saved-artifact validation only, run with
+do not create `logs`, raw logs, temp stdout/stderr files, sidecars, saved-run
+indexes, or digest shards. They should create aggregate-only `state/metrics.json`
+without run IDs, local paths, or command strings. For saved-artifact validation only, run with
 `--save-artifacts` or `KDS_SAVE_ARTIFACTS=1` and verify missing commands create
 a raw log, sidecar, and index entry; parallel saved wrapped commands append
 valid `runs.jsonl` lines; and stale `*.tmp` files under the KDS logs tree are
 cleaned up only after they are old enough to be considered abandoned.
 
 To validate summary behavior, run a failing command twice and confirm default
-output says artifacts were not saved. For saved-artifact repeat tracking and
-drilldown validation, run the same failure twice with `--save-artifacts`; then
-check `kds logs <id> --error-window` and `kds logs last --error-window`.
+output says saved logs are not available. Also validate `--budget tiny`,
+`--budget normal`, `--budget verbose`, and `KDS_SUMMARY_BUDGET`. For
+saved-artifact repeat tracking and drilldown validation, run the same failure
+twice with `--save-artifacts`; then check `kds logs <id> --error-window` and
+`kds logs last --error-window`.
 Raw mode should tee command output live while staying memory-only by default.
 Set `KDS_SAVE_ARTIFACTS=1` and `KDS_MAX_RAW_BYTES=5` for a temp `KDS_HOME` run
 and verify the raw log contains a truncation note and the sidecar records
@@ -76,7 +79,8 @@ intentional uncapped persistence.
 
 To validate imported log behavior, pipe a small synthetic failure into
 `kds summarize --name synthetic-ci --exit-code 1` with temp `KDS_HOME`.
-Confirm that KDS exits successfully and does not create `logs` or `state`.
+Confirm that KDS exits successfully, does not create `logs`, and writes only
+aggregate metrics under `state`.
 For saved-artifact import validation, run with `--save-artifacts`, confirm it
 records exit code `1` in the sidecar, writes a redacted imported log artifact,
 updates metrics/index state, and that `kds evidence last` does not print raw
@@ -84,8 +88,9 @@ imported bodies or secrets.
 
 To validate exact-output passthrough, run proof-style Git commands through
 `kds --` with a temp `KDS_HOME`: `git status`, `git rev-parse`,
-`git hash-object`, `git diff ...`, and `git log --oneline` should print native
-Git output and should not create KDS artifacts.
+`git hash-object`, `git diff ...`, `git show --stat`, `git ls-files`,
+`git describe`, `git tag`, and `git log --oneline` should print native Git
+output and should not create KDS artifacts.
 
 To validate retention, create old `.log` and `.summary.json` files under a temp
 KDS logs directory, then run `kds clean --older-than 30d`. KDS should only remove

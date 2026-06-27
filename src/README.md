@@ -30,7 +30,9 @@ Scope: `src/`.
 - Drain child stdout and stderr in both memory-only and saved-artifact modes.
 - Keep default displayed output compact and safe.
 - Do not write raw logs, temp stdout/stderr files, sidecars, run indexes, or
-  metrics by default.
+  repeat-failure tracking state by default. Default runs may write
+  aggregate-only gain metrics without run IDs, local paths, sidecars, or command
+  strings.
 - Do not suggest saved artifacts, local logging, or raw-log persistence as
   routine next actions. Only use saved-artifact mode when the user explicitly
   asks for local persisted evidence.
@@ -48,6 +50,9 @@ Scope: `src/`.
 
 - V1 automatic activation is PowerShell-only.
 - Keep hook wrapping conservative and allowlisted.
+- Keep Cargo commands native in automatic hooks. Do not auto-wrap `cargo check`,
+  `cargo test`, `cargo build`, or `cargo clippy`; explicit `KDS -- cargo ...`
+  remains available for user-directed wrapping.
 - Do not automatically wrap Git commands, KDS itself, exact-output proof
   commands, interactive commands, password prompts, SSH sessions, daemons,
   deploy/publish commands, or commands likely to print secrets.

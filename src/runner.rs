@@ -16,7 +16,7 @@ use crate::storage::{
 use crate::summarize;
 
 const DEFAULT_RAW_BYTE_LIMIT: u64 = 10 * 1024 * 1024;
-const DEFAULT_SUMMARY_BUDGET: &str = "normal";
+const DEFAULT_SUMMARY_BUDGET: &str = "auto";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -33,7 +33,13 @@ impl Mode {
     }
 }
 
-pub fn run(argv: Vec<String>, mode: Mode, show_paths: bool, save_artifacts: bool) -> Result<i32> {
+pub fn run(
+    argv: Vec<String>,
+    mode: Mode,
+    show_paths: bool,
+    summary_budget: Option<String>,
+    save_artifacts: bool,
+) -> Result<i32> {
     if argv.is_empty() {
         eprintln!("kds: no wrapped command provided");
         return Ok(2);
@@ -44,7 +50,7 @@ pub fn run(argv: Vec<String>, mode: Mode, show_paths: bool, save_artifacts: bool
     }
 
     if !artifacts_enabled(save_artifacts) {
-        return run_memory_only(argv, mode, show_paths);
+        return run_memory_only(argv, mode, show_paths, summary_budget);
     }
 
     let cwd = std::env::current_dir()?;
@@ -83,6 +89,7 @@ pub fn run(argv: Vec<String>, mode: Mode, show_paths: bool, save_artifacts: bool
                 paths: &paths,
                 run_paths: &run_paths,
                 mode,
+                summary_budget: effective_summary_budget(summary_budget.as_deref()),
                 command: &safe_command,
                 safe_argv: &safe_argv,
                 safe_command_identity: &safe_command_identity,
@@ -267,6 +274,7 @@ pub fn run(argv: Vec<String>, mode: Mode, show_paths: bool, save_artifacts: bool
         primary_failure: extracted.primary_failure,
         delta,
         top_errors: extracted.top_errors,
+        top_warnings: extracted.top_warnings,
         file_hits: extracted.file_hits,
         tail: extracted.tail,
         suggested_next_reads: extracted.suggested_next_reads,
@@ -278,7 +286,7 @@ pub fn run(argv: Vec<String>, mode: Mode, show_paths: bool, save_artifacts: bool
         previous_exact_match_run: previous_match,
         started_at: started.to_rfc3339(),
         command_kind: command_kind.clone(),
-        summary_budget: DEFAULT_SUMMARY_BUDGET.to_string(),
+        summary_budget: effective_summary_budget(summary_budget.as_deref()),
         capture_mode: "stdout/stderr piped to local temp files".to_string(),
         spawn_error: None,
         runtime_warnings,
@@ -314,7 +322,12 @@ pub fn run(argv: Vec<String>, mode: Mode, show_paths: bool, save_artifacts: bool
     Ok(exit_code)
 }
 
-fn run_memory_only(argv: Vec<String>, mode: Mode, show_paths: bool) -> Result<i32> {
+fn run_memory_only(
+    argv: Vec<String>,
+    mode: Mode,
+    show_paths: bool,
+    summary_budget: Option<String>,
+) -> Result<i32> {
     let cwd = std::env::current_dir()?;
     let started = Local::now();
     let command = storage::command_string(&argv);
@@ -372,10 +385,12 @@ fn run_memory_only(argv: Vec<String>, mode: Mode, show_paths: bool) -> Result<i3
                 raw_stderr_chars: failure.chars().count(),
                 started_at: started.to_rfc3339(),
                 command_kind,
+                summary_budget: effective_summary_budget(summary_budget.as_deref()),
                 capture_mode: "memory-only; artifacts disabled".to_string(),
                 spawn_error: Some(failure),
             });
             let display = finalize_sidecar_counts(&mut sidecar, show_paths);
+            record_memory_metric(&sidecar);
             if mode == Mode::Compact {
                 print!("{display}");
             }
@@ -480,10 +495,12 @@ fn run_memory_only(argv: Vec<String>, mode: Mode, show_paths: bool) -> Result<i3
         raw_stderr_chars,
         started_at: started.to_rfc3339(),
         command_kind,
+        summary_budget: effective_summary_budget(summary_budget.as_deref()),
         capture_mode: "memory-only; artifacts disabled".to_string(),
         spawn_error: None,
     });
     let display = finalize_sidecar_counts(&mut sidecar, show_paths);
+    record_memory_metric(&sidecar);
 
     if mode == Mode::Compact {
         print!("{display}");
@@ -639,6 +656,7 @@ pub fn summarize_import(args: crate::cli::SummarizeArgs) -> Result<i32> {
         primary_failure: extracted.primary_failure,
         delta,
         top_errors: extracted.top_errors,
+        top_warnings: extracted.top_warnings,
         file_hits: extracted.file_hits,
         tail: extracted.tail,
         suggested_next_reads: extracted.suggested_next_reads,
@@ -650,7 +668,7 @@ pub fn summarize_import(args: crate::cli::SummarizeArgs) -> Result<i32> {
         previous_exact_match_run: previous_match,
         started_at: started.to_rfc3339(),
         command_kind: command_kind.clone(),
-        summary_budget: DEFAULT_SUMMARY_BUDGET.to_string(),
+        summary_budget: effective_summary_budget(args.budget.map(|budget| budget.as_str())),
         capture_mode: import_capture_mode(args.file.is_some()).to_string(),
         spawn_error: None,
         runtime_warnings,
@@ -746,10 +764,12 @@ fn summarize_import_memory_only(args: crate::cli::SummarizeArgs) -> Result<i32> 
         raw_stderr_chars,
         started_at: started.to_rfc3339(),
         command_kind,
+        summary_budget: effective_summary_budget(args.budget.map(|budget| budget.as_str())),
         capture_mode: import_memory_capture_mode(args.file.is_some()).to_string(),
         spawn_error: None,
     });
     let display = finalize_sidecar_counts(&mut sidecar, args.show_paths);
+    record_memory_metric(&sidecar);
 
     print!("{display}");
     Ok(0)
@@ -788,6 +808,7 @@ struct MemorySidecarInput {
     raw_stderr_chars: usize,
     started_at: String,
     command_kind: String,
+    summary_budget: String,
     capture_mode: String,
     spawn_error: Option<String>,
 }
@@ -843,6 +864,7 @@ fn memory_sidecar(input: MemorySidecarInput) -> SummarySidecar {
         primary_failure: input.extracted.primary_failure,
         delta: None,
         top_errors: input.extracted.top_errors,
+        top_warnings: input.extracted.top_warnings,
         file_hits: input.extracted.file_hits,
         tail: input.extracted.tail,
         suggested_next_reads: input.extracted.suggested_next_reads,
@@ -854,7 +876,7 @@ fn memory_sidecar(input: MemorySidecarInput) -> SummarySidecar {
         previous_exact_match_run: None,
         started_at: input.started_at,
         command_kind: input.command_kind,
-        summary_budget: DEFAULT_SUMMARY_BUDGET.to_string(),
+        summary_budget: input.summary_budget,
         capture_mode: input.capture_mode,
         spawn_error: input.spawn_error,
         runtime_warnings: Vec::new(),
@@ -1007,7 +1029,8 @@ fn should_passthrough(argv: &[String]) -> bool {
         return false;
     };
     match command.name.to_ascii_lowercase().as_str() {
-        "diff" | "status" | "rev-parse" | "hash-object" => true,
+        "describe" | "diff" | "hash-object" | "ls-files" | "rev-parse" | "show" | "status"
+        | "tag" => true,
         "log" => command.args.iter().any(|arg| {
             *arg == "--oneline" || *arg == "--format=oneline" || *arg == "--pretty=oneline"
         }),
@@ -1101,6 +1124,7 @@ struct SpawnFailureRecord<'a> {
     paths: &'a Paths,
     run_paths: &'a RunPaths,
     mode: Mode,
+    summary_budget: String,
     command: &'a str,
     safe_argv: &'a [String],
     safe_command_identity: &'a str,
@@ -1189,6 +1213,7 @@ fn record_spawn_failure(record: SpawnFailureRecord<'_>) {
         primary_failure: extracted.primary_failure,
         delta: None,
         top_errors: extracted.top_errors,
+        top_warnings: extracted.top_warnings,
         file_hits: extracted.file_hits,
         tail: extracted.tail,
         suggested_next_reads: extracted.suggested_next_reads,
@@ -1200,7 +1225,7 @@ fn record_spawn_failure(record: SpawnFailureRecord<'_>) {
         previous_exact_match_run: None,
         started_at: record.started.to_rfc3339(),
         command_kind: record.command_kind.to_string(),
-        summary_budget: DEFAULT_SUMMARY_BUDGET.to_string(),
+        summary_budget: record.summary_budget,
         capture_mode: "not started; spawn failed".to_string(),
         spawn_error: Some(failure),
         runtime_warnings,
@@ -1306,6 +1331,36 @@ fn finalize_sidecar_counts(sidecar: &mut SummarySidecar, show_paths: bool) -> St
     }
 
     summarize::format_compact_with_paths(sidecar, show_paths)
+}
+
+fn record_memory_metric(sidecar: &SummarySidecar) {
+    let result = (|| -> Result<()> {
+        let paths = Paths::discover()?;
+        storage::with_state_lock(&paths, || storage::record_metric_only(&paths, sidecar))
+    })();
+    if let Err(err) = result {
+        eprintln!("kds: metric update failed: {err:#}; wrapped exit code preserved");
+    }
+}
+
+fn effective_summary_budget(cli_budget: Option<&str>) -> String {
+    let selected = cli_budget
+        .map(ToOwned::to_owned)
+        .or_else(|| std::env::var("KDS_SUMMARY_BUDGET").ok());
+    selected
+        .as_deref()
+        .map(normalize_summary_budget)
+        .unwrap_or_else(|| DEFAULT_SUMMARY_BUDGET.to_string())
+}
+
+fn normalize_summary_budget(value: &str) -> String {
+    match value.to_ascii_lowercase().as_str() {
+        "tiny" => "tiny".to_string(),
+        "normal" => "normal".to_string(),
+        "verbose" => "verbose".to_string(),
+        "auto" => "auto".to_string(),
+        _ => DEFAULT_SUMMARY_BUDGET.to_string(),
+    }
 }
 
 fn placeholder_repeat_status(run_paths: &RunPaths) -> RepeatStatus {
@@ -1646,6 +1701,8 @@ enum StreamTee {
     Stderr,
 }
 
+const PIPE_BUFFER_SIZE: usize = 64 * 1024;
+
 fn spawn_pipe_copy<R>(
     mut reader: R,
     mut file: fs::File,
@@ -1659,7 +1716,7 @@ where
     thread::spawn(move || {
         let mut capture = PipeCapture::default();
         let mut summary = summarize::StreamSummaryBuilder::new(stream);
-        let mut buffer = [0_u8; 8192];
+        let mut buffer = [0_u8; PIPE_BUFFER_SIZE];
         loop {
             let read = reader.read(&mut buffer)?;
             if read == 0 {
@@ -1703,7 +1760,7 @@ where
     thread::spawn(move || {
         let mut capture = PipeCapture::default();
         let mut summary = summarize::StreamSummaryBuilder::new(stream);
-        let mut buffer = [0_u8; 8192];
+        let mut buffer = [0_u8; PIPE_BUFFER_SIZE];
         loop {
             let read = reader.read(&mut buffer)?;
             if read == 0 {

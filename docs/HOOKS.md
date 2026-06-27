@@ -28,22 +28,45 @@ directory to the current PowerShell session PATH when needed, and invokes KDS by
 the short command name so wrapped commands display as `KDS` rather than the full
 install path.
 
+## When to use KDS
+
+Use KDS for noisy commands where you mainly need to know what failed:
+
+- `npm test`
+- `pnpm build`
+- `cargo test`
+- `pytest`
+- `go test`
+- `dotnet test`
+
+## When not to use KDS
+
+Do not use KDS when the exact output is the thing you need to keep or share:
+
+- `git status`
+- `git diff`
+- `git diff --check`
+- `git show --stat`
+- `git ls-files`
+- `git describe`
+- `git tag`
+- commands that ask for passwords
+- SSH sessions
+- long-running dev servers
+- commands that may print secrets
+
+When in doubt, run the command normally.
+
 The hook must not wrap KDS itself, precise searches, interactive sessions,
 password prompts, SSH sessions, long-running daemons, or commands likely to
 print secrets.
 
 Git commands are not wrapped automatically because their output is often
-captured by scripts, prompt themes, readiness checks, and other tools.
-
-Proof-style Git commands are exact-output workflows. If `git status`,
-`git rev-parse`, `git hash-object`, `git diff ...`, or `git log --oneline` is
-accidentally invoked through KDS, KDS passes it through to native Git without
-writing KDS run artifacts.
-
-For readiness workflows, keep exact evidence commands native. Do not route
-proof-line commands through KDS when their output is the deliverable, including
-`git status`, `git diff --name-only`, `git diff --check`, tracked diff hash
-commands, and publish/install proof-line extraction.
+captured by scripts, prompt themes, and other tools. If `git status`,
+`git rev-parse`, `git hash-object`, `git diff ...`, `git show`, `git ls-files`,
+`git describe`, `git tag`, or `git log --oneline` is accidentally invoked
+through KDS, KDS passes it through to native Git without writing saved KDS
+files.
 
 The hook ships built-in profiles for noisy verification ecosystems. Profiles
 match command categories such as `test`, `build`, `check`, `lint`, `typecheck`,
@@ -55,6 +78,10 @@ Built-in JavaScript and TypeScript profiles include `npm`, `pnpm`, `yarn`,
 `bun`, `deno`, `jest`, `vitest`, `tsc`, `vue-tsc`, `eslint`, `biome`,
 `prettier --check`, and `playwright test`. Watch/dev/UI forms run natively
 where the profile can identify them.
+
+Cargo commands run natively through the automatic hook. This keeps Rust
+validation output exact and avoids adding a KDS wrapper process around Cargo's
+target-directory locking.
 
 Built-in Python profiles include `pytest`, `python -m pytest`,
 `python -m unittest`, `python -m ruff`, `python -m mypy`,

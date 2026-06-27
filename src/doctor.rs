@@ -246,7 +246,10 @@ fn inspect_desktop_home(home: &Path) -> DesktopHomeStatus {
     let config_toml = home.join("config.toml");
     let hook_script_valid = fs::read_to_string(&hook_script)
         .map(|text| {
-            text.contains("PreToolUse") && text.contains("tool_name") && text.contains("KDS --")
+            text.contains("PreToolUse")
+                && text.contains("tool_name")
+                && text.contains("updatedInput")
+                && text.contains("CodexKD\\bin\\kds.exe")
         })
         .unwrap_or(false);
 
@@ -562,7 +565,7 @@ mod tests {
         let hook_script = hooks_dir.join("kds-pre-tool-use.ps1");
         fs::write(
             &hook_script,
-            "$event.hook_event_name -ne 'PreToolUse'\n$event.tool_name\nKDS -- cargo test\n",
+            "$event.hook_event_name -ne 'PreToolUse'\n$event.tool_name\n$kdsExe = Join-Path $env:LOCALAPPDATA 'CodexKD\\bin\\kds.exe'\nupdatedInput\n",
         )
         .unwrap();
 
